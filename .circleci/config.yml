@@ -8,10 +8,122 @@ jobs:
     working_directory: /src
     steps:
       - checkout
-      - run: semgrep --config semgrep.yml --config https://semgrep.dev/p/ocaml --error --strict --verbose --exclude tests --exclude TODO --exclude _build .
+      - run: semgrep --config semgrep.yml --error --strict --verbose --exclude tests --exclude TODO --exclude _build .
+
+  # For the benchmarks below, we had two alternatives:
+  # A. run semgrep container from existing container: requires mounting
+  #    a volume, which is disabled by CircleCI (results in empty folder
+  #    once mounted).
+  # B. run everything inside the semgrep-dev container, which comes with
+  #    semgrep and whatever utilities we added.
+  #
+  # We use B out of necessity.
+  #
+  # Go through the same steps as the real benchmarks but quickly.
+  dummy-benchmarks:
+    docker:
+      - image: returntocorp/semgrep-dev:develop
+    steps:
+      - checkout
+      - run:
+          name: dummy benchmarks
+          command: |
+            cd perf
+            ./run-benchmarks --dummy --upload
+
+  # Real benchmarks
+  benchmarks:
+    docker:
+      - image: returntocorp/semgrep-dev:develop
+    steps:
+      - checkout
+      - run:
+          name: benchmarks
+          command: |
+            cd perf
+            ./run-benchmarks --upload
+
+  # Run parsing stats and publish them to the semgrep dashboard.
+  parsing-stats:
+    docker:
+      - image: returntocorp/semgrep-dev:develop
+    steps:
+      - checkout
+      - run:
+          name: parsing stats
+          no_output_timeout: 60m
+          command: |
+            cd parsing-stats
+            ./run-all --upload
+      - store_artifacts:
+          path: parsing-stats/logs
+      - store_artifacts:
+          path: parsing-stats/results.txt
 
 workflows:
   version: 2
   semgrep:
     jobs:
       - semgrep
+
+  # Daily semgrep benchmarks
+  benchmarks:
+    triggers:
+      - schedule:
+          # Run at 00:00 every day, UTC.
+          cron: "0 0 * * *"
+          filters:
+            branches:
+              only:
+                - develop
+    jobs:
+      - benchmarks:
+          # Run only on these branches
+          filters:
+            branches:
+              only:
+                - develop
+
+  # This is to check whether we broke the benchmarks before merging a branch.
+  dummy-benchmarks-on-commit:
+    jobs:
+      - dummy-benchmarks
+
+  # This is for testing. Requires pushing to a branch named 'force-benchmarks'.
+  # It can take hours, use with care.
+  benchmarks-on-commit:
+    jobs:
+      - benchmarks:
+          filters:
+            branches:
+              only:
+                - force-benchmarks
+
+  scheduled-parsing-stats:
+    triggers:
+      - schedule:
+          # Run at 00:00 every day, UTC.
+          cron: "0 0 * * *"
+          filters:
+            branches:
+              only:
+                - develop
+                - main
+    jobs:
+      - parsing-stats:
+          # Run only on these branches
+          filters:
+            branches:
+              only:
+                - develop
+                - main
+
+  # This is for testing or for forcing a stats job. Requires pushing
+  # to a branch named 'parsing-stats'.
+  parsing-stats-on-commit:
+    jobs:
+      - parsing-stats:
+          filters:
+            branches:
+              only:
+                - parsing-stats

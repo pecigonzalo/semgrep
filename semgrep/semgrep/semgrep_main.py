@@ -1,68 +1,52 @@
 import json
-import logging
+import subprocess
+import time
 from io import StringIO
 from pathlib import Path
+from re import sub
 from typing import Any
 from typing import Dict
 from typing import List
 from typing import Optional
-from typing import Set
 from typing import Tuple
+from typing import Union
 
 import attr
+from colorama import Fore
 
-import semgrep.config_resolver
 from semgrep.autofix import apply_fixes
+from semgrep.config_resolver import get_config
 from semgrep.constants import COMMA_SEPARATED_LIST_RE
-from semgrep.constants import DEFAULT_CONFIG_FILE
 from semgrep.constants import DEFAULT_TIMEOUT
 from semgrep.constants import NOSEM_INLINE_RE
 from semgrep.constants import OutputFormat
-from semgrep.constants import RULES_KEY
 from semgrep.core_runner import CoreRunner
-from semgrep.error import InvalidRuleSchemaError
+from semgrep.error import Level
 from semgrep.error import MISSING_CONFIG_EXIT_CODE
 from semgrep.error import SemgrepError
+from semgrep.metric_manager import metric_manager
+from semgrep.old_core_runner import OldCoreRunner
 from semgrep.output import OutputHandler
 from semgrep.output import OutputSettings
+from semgrep.profile_manager import ProfileManager
 from semgrep.rule import Rule
-from semgrep.rule_lang import YamlMap
-from semgrep.rule_lang import YamlTree
 from semgrep.rule_match import RuleMatch
+from semgrep.semgrep_types import JOIN_MODE
 from semgrep.target_manager import TargetManager
+from semgrep.util import manually_search_file
+from semgrep.util import partition
+from semgrep.util import sub_check_output
+from semgrep.util import with_color
+from semgrep.verbose_logging import getLogger
 
-logger = logging.getLogger(__name__)
 
-
-def get_config(
-    pattern: str, lang: str, config_strs: List[str]
-) -> Tuple[semgrep.config_resolver.Config, List[SemgrepError]]:
-    # let's check for a pattern
-    if pattern:
-        # and a language
-        if not lang:
-            raise SemgrepError("language must be specified when a pattern is passed")
-
-        # TODO for now we generate a manual config. Might want to just call semgrep -e ... -l ...
-        config, errors = semgrep.config_resolver.Config.from_pattern_lang(pattern, lang)
-    else:
-        # else let's get a config. A config is a dict from config_id -> config. Config Id is not well defined at this point.
-        config, errors = semgrep.config_resolver.Config.from_config_list(config_strs)
-
-    # if we can't find a config, use default r2c rules
-    if not config:
-        raise SemgrepError(
-            f"No config given and {DEFAULT_CONFIG_FILE} was not found. Try running with --help to debug or if you want to download a default config, try running with --config r2c"
-        )
-
-    return config, errors
+logger = getLogger(__name__)
 
 
 def notify_user_of_work(
     filtered_rules: List[Rule],
     include: List[str],
     exclude: List[str],
-    verbose: bool = False,
 ) -> None:
     """
     Notify user of what semgrep is about to do, including:
@@ -79,15 +63,16 @@ def notify_user_of_work(
         for exc in exclude:
             logger.info(f"- {exc}")
     logger.info(f"running {len(filtered_rules)} rules...")
-    if verbose:
-        logger.info("rules:")
-        for rule in filtered_rules:
-            logger.info(f"- {rule.id}")
+    logger.verbose("rules:")
+    for rule in filtered_rules:
+        logger.verbose(f"- {rule.id}")
 
 
-def rule_match_nosem(rule_match: RuleMatch, strict: bool) -> bool:
+def rule_match_nosem(
+    rule_match: RuleMatch, strict: bool
+) -> Tuple[bool, List[SemgrepError]]:
     if not rule_match.lines:
-        return False
+        return False, []
 
     # Only consider the first line of a match. This will keep consistent
     # behavior on where we expect a 'nosem' comment to exist. If we allow these
@@ -95,57 +80,61 @@ def rule_match_nosem(rule_match: RuleMatch, strict: bool) -> bool:
     # the 'nosem' is referring to.
     re_match = NOSEM_INLINE_RE.search(rule_match.lines[0])
     if re_match is None:
-        return False
+        return False, []
 
     ids_str = re_match.groupdict()["ids"]
     if ids_str is None:
-        logger.debug(
+        logger.verbose(
             f"found 'nosem' comment, skipping rule '{rule_match.id}' on line {rule_match.start['line']}"
         )
-        return True
+        return True, []
 
+    # Strip quotes to allow for use of nosem as an HTML attribute inside tags.
+    # HTML comments inside tags are not allowed by the spec.
     pattern_ids = {
-        pattern_id.strip()
+        pattern_id.strip().strip("\"'")
         for pattern_id in COMMA_SEPARATED_LIST_RE.split(ids_str)
         if pattern_id.strip()
     }
 
+    # Filter out ids that are not alphanum+dashes+underscores+periods.
+    # This removes trailing symbols from comments, such as HTML comments `-->`
+    # or C-like multiline comments `*/`.
+    pattern_ids = set(filter(lambda x: not sub(r"[\w\-\.]+", "", x), pattern_ids))
+
+    errors = []
     result = False
     for pattern_id in pattern_ids:
         if rule_match.id == pattern_id:
-            logger.debug(
+            logger.verbose(
                 f"found 'nosem' comment with id '{pattern_id}', skipping rule '{rule_match.id}' on line {rule_match.start['line']}"
             )
             result = result or True
         else:
             message = f"found 'nosem' comment with id '{pattern_id}', but no corresponding rule trying '{rule_match.id}'"
             if strict:
-                raise SemgrepError(message)
+                errors.append(SemgrepError(message, level=Level.WARN))
             else:
-                logger.debug(message)
+                logger.verbose(message)
 
-    return result
+    return result, errors
 
 
-def invoke_semgrep(config: Path, targets: List[Path], **kwargs: Any) -> Any:
+def invoke_semgrep(
+    config: Path,
+    targets: List[Path],
+    output_settings: Optional[OutputSettings] = None,
+    **kwargs: Any,
+) -> Union[Dict[str, Any], str]:
     """
-    Call semgrep with config on targets and return result as a json object
-
-    Uses default arguments of MAIN unless overwritten with a kwarg
+    Return Semgrep results of 'config' on 'targets' as a dict|str
+    Uses default arguments of 'semgrep_main.main' unless overwritten with 'kwargs'
     """
+    if output_settings is None:
+        output_settings = OutputSettings(output_format=OutputFormat.JSON)
+
     io_capture = StringIO()
-    output_handler = OutputHandler(
-        OutputSettings(
-            output_format=OutputFormat.JSON,
-            output_destination=None,
-            error_on_findings=False,
-            verbose_errors=False,
-            strict=False,
-            json_stats=False,
-            output_per_finding_max_lines_limit=None,
-        ),
-        stdout=io_capture,
-    )
+    output_handler = OutputHandler(output_settings, stdout=io_capture)
     main(
         output_handler=output_handler,
         target=[str(t) for t in targets],
@@ -155,7 +144,14 @@ def invoke_semgrep(config: Path, targets: List[Path], **kwargs: Any) -> Any:
         **kwargs,
     )
     output_handler.close()
-    return json.loads(io_capture.getvalue())
+
+    result: Union[Dict[str, Any], str] = (
+        json.loads(io_capture.getvalue())
+        if output_settings.output_format.is_json()
+        else io_capture.getvalue()
+    )
+
+    return result
 
 
 def main(
@@ -176,9 +172,11 @@ def main(
     no_git_ignore: bool = False,
     timeout: int = DEFAULT_TIMEOUT,
     max_memory: int = 0,
+    max_target_bytes: int = 0,
     timeout_threshold: int = 0,
     skip_unknown_extensions: bool = False,
     severity: Optional[List[str]] = None,
+    optimizations: str = "none",
 ) -> None:
     if include is None:
         include = []
@@ -210,15 +208,26 @@ def main(
         invalid_msg = (
             f"({len(errors)} config files were invalid)" if len(errors) else ""
         )
-        logger.debug(
+        logger.verbose(
             f"running {len(filtered_rules)} rules from {len(configs_obj.valid)} config{plural} {config_id_if_single} {invalid_msg}"
         )
 
         if len(configs_obj.valid) == 0:
-            raise SemgrepError(
-                f"no valid configuration file found ({len(errors)} configs were invalid)",
-                code=MISSING_CONFIG_EXIT_CODE,
-            )
+            if len(errors) > 0:
+                raise SemgrepError(
+                    f"no valid configuration file found ({len(errors)} configs were invalid)",
+                    code=MISSING_CONFIG_EXIT_CODE,
+                )
+            else:
+                raise SemgrepError(
+                    """You need to specify a config with --config=<semgrep.dev config name|localfile|localdirectory|url>.
+If you're looking for a config to start with, there are thousands at: https://semgrep.dev
+The two most popular are:
+    --config=p/ci # find logic bugs, and high-confidence security vulnerabilities; recommended for CI
+    --config=p/security-audit # find security audit points; noisy, not recommended for CI
+""",
+                    code=MISSING_CONFIG_EXIT_CODE,
+                )
 
         notify_user_of_work(filtered_rules, include, exclude)
 
@@ -226,52 +235,174 @@ def main(
     target_manager = TargetManager(
         includes=include,
         excludes=exclude,
+        max_target_bytes=max_target_bytes,
         targets=target,
         respect_git_ignore=respect_git_ignore,
         output_handler=output_handler,
         skip_unknown_extensions=skip_unknown_extensions,
     )
 
-    # actually invoke semgrep
-    (
-        rule_matches_by_rule,
-        debug_steps_by_rule,
-        semgrep_errors,
-        all_targets,
-        profiler,
-    ) = CoreRunner(
-        allow_exec=dangerously_allow_arbitrary_code_execution_from_rules,
-        jobs=jobs,
-        timeout=timeout,
-        max_memory=max_memory,
-        timeout_threshold=timeout_threshold,
-    ).invoke_semgrep(
-        target_manager, filtered_rules
+    profiler = ProfileManager()
+
+    # # Turn off optimizations if using features not supported yet
+    if optimizations == "all":
+        # step by step evaluation output not yet supported
+        if output_handler.settings.debug:
+            logger.info(
+                "Running without optimizations since step-by-step evaluation output desired"
+            )
+            optimizations = "none"
+
+        elif any(rule.has_pattern_where_python() for rule in filtered_rules):
+            logger.info(
+                "Running without optimizations since running pattern-where-python rules"
+            )
+            optimizations = "none"
+        elif any(len(rule.equivalences) > 0 for rule in filtered_rules):
+            logger.info("Running without optimizations since running equivalence rules")
+            optimizations = "none"
+
+    if optimizations == "none":
+        logger.warning(
+            with_color(
+                Fore.RED,
+                "Deprecation Notice: running with `--optimizations none` will be deprecated by 0.60.0\n"
+                "This includes the following functionality:\n"
+                "- pattern-where-python\n"
+                "- taint-mode\n"
+                "- equivalences\n"
+                "- step-by-step evaluation output\n"
+                "If you are seeing this notice, without specifing `--optimizations none` it means the rules\n"
+                "you are running are using some of this functionality.",
+            )
+        )
+
+    join_rules, rest_of_the_rules = partition(
+        lambda rule: rule.mode == JOIN_MODE,
+        filtered_rules,
     )
+    filtered_rules = rest_of_the_rules
+
+    start_time = time.time()
+    # actually invoke semgrep
+    if optimizations == "none":
+        (
+            rule_matches_by_rule,
+            debug_steps_by_rule,
+            semgrep_errors,
+            all_targets,
+            profiling_data,
+        ) = OldCoreRunner(
+            output_settings=output_handler.settings,
+            allow_exec=dangerously_allow_arbitrary_code_execution_from_rules,
+            jobs=jobs,
+            timeout=timeout,
+            max_memory=max_memory,
+            timeout_threshold=timeout_threshold,
+            optimizations=optimizations,
+        ).invoke_semgrep(
+            target_manager, profiler, filtered_rules
+        )
+    else:
+        (
+            rule_matches_by_rule,
+            debug_steps_by_rule,
+            semgrep_errors,
+            all_targets,
+            profiling_data,
+        ) = CoreRunner(
+            output_settings=output_handler.settings,
+            allow_exec=dangerously_allow_arbitrary_code_execution_from_rules,
+            jobs=jobs,
+            timeout=timeout,
+            max_memory=max_memory,
+            timeout_threshold=timeout_threshold,
+            optimizations=optimizations,
+        ).invoke_semgrep(
+            target_manager, profiler, filtered_rules
+        )
+
+    if join_rules:
+        import semgrep.join_rule as join_rule
+
+        for rule in join_rules:
+            join_rule_matches, join_rule_errors = join_rule.run_join_rule(
+                rule.raw, [Path(t) for t in target_manager.targets]
+            )
+            join_rule_matches_by_rule = {Rule.from_json(rule.raw): join_rule_matches}
+            rule_matches_by_rule.update(join_rule_matches_by_rule)
+            output_handler.handle_semgrep_errors(join_rule_errors)
+
+    profiler.save("total_time", start_time)
 
     output_handler.handle_semgrep_errors(semgrep_errors)
 
-    rule_matches_by_rule = {
-        rule: [
-            attr.evolve(rule_match, is_ignored=rule_match_nosem(rule_match, strict))
-            for rule_match in rule_matches
-        ]
-        for rule, rule_matches in rule_matches_by_rule.items()
-    }
+    nosem_errors = []
+    for rule, rule_matches in rule_matches_by_rule.items():
+        evolved_rule_matches = []
+        for rule_match in rule_matches:
+            ignored, returned_errors = rule_match_nosem(rule_match, strict)
+            evolved_rule_matches.append(attr.evolve(rule_match, is_ignored=ignored))
+            nosem_errors.extend(returned_errors)
+        rule_matches_by_rule[rule] = evolved_rule_matches
 
+    output_handler.handle_semgrep_errors(nosem_errors)
+
+    num_findings_nosem = 0
     if not disable_nosem:
-        rule_matches_by_rule = {
-            rule: [
-                rule_match for rule_match in rule_matches if not rule_match._is_ignored
-            ]
-            for rule, rule_matches in rule_matches_by_rule.items()
-        }
+        filtered_rule_matches_by_rule = {}
+        for rule, rule_matches in rule_matches_by_rule.items():
+            filtered_rule_matches = []
+            for rule_match in rule_matches:
+                if rule_match._is_ignored:
+                    num_findings_nosem += 1
+                else:
+                    filtered_rule_matches.append(rule_match)
+            filtered_rule_matches_by_rule[rule] = filtered_rule_matches
+        rule_matches_by_rule = filtered_rule_matches_by_rule
 
     num_findings = sum(len(v) for v in rule_matches_by_rule.values())
     stats_line = f"ran {len(filtered_rules)} rules on {len(all_targets)} files: {num_findings} findings"
 
+    if metric_manager.is_enabled:
+        project_url = None
+        try:
+            project_url = sub_check_output(
+                ["git", "ls-remote", "--get-url"],
+                encoding="utf-8",
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            logger.debug(f"Failed to get project url from 'git ls-remote': {e}")
+            try:
+                # add \n to match urls from git ls-remote (backwards compatability)
+                project_url = manually_search_file(".git/config", ".com", "\n")
+            except Exception as e:
+                logger.debug(f"Failed to get project url from .git/config: {e}")
+
+        metric_manager.set_project_hash(project_url)
+        metric_manager.set_configs_hash(configs)
+        metric_manager.set_rules_hash(filtered_rules)
+        metric_manager.set_num_rules(len(filtered_rules))
+        metric_manager.set_num_targets(len(all_targets))
+        metric_manager.set_num_findings(num_findings)
+        metric_manager.set_num_ignored(num_findings_nosem)
+        metric_manager.set_run_time(profiler.calls["total_time"][0])
+        total_bytes_scanned = sum(t.stat().st_size for t in all_targets)
+        metric_manager.set_total_bytes_scanned(total_bytes_scanned)
+        metric_manager.set_errors(list(type(e).__name__ for e in semgrep_errors))
+        metric_manager.set_run_timings(
+            profiling_data, list(all_targets), filtered_rules
+        )
+
     output_handler.handle_semgrep_core_output(
-        rule_matches_by_rule, debug_steps_by_rule, stats_line, all_targets, profiler
+        rule_matches_by_rule,
+        debug_steps_by_rule,
+        stats_line,
+        all_targets,
+        profiler,
+        filtered_rules,
+        profiling_data,
     )
 
     if autofix:

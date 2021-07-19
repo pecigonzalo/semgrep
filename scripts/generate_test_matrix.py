@@ -7,7 +7,6 @@ import json
 import multiprocessing
 import os
 import subprocess
-import sys
 import tempfile
 from typing import Any
 from typing import Dict
@@ -17,7 +16,7 @@ from typing import Tuple
 
 from ruamel.yaml import YAML
 
-yaml = YAML(typ="rt")
+yaml = YAML()
 
 
 FEATURES = ["dots", "equivalence", "metavar", "misc"]
@@ -65,13 +64,14 @@ LANGUAGE_EXCEPTIONS = {
     "c": ["naming_import", "class_def", "anno"],
     "ruby": ["naming_import", "typed", "anno"],
     "python": ["typed"],
-    "js": ["typed", "anno"],
+    "js": ["typed"],
     "go": ["class_def", "anno"],
     "ocaml": ["anno", "key_value"],
 }
 
 EXCLUDE = ["TODO", "POLYGLOT", "e2e", "OTHER"]
 
+# TODO: add dots_for, implemented in JS and Go now
 CHEATSHEET_ENTRIES = {
     "concrete": ["syntax"],
     "dots": [
@@ -177,25 +177,30 @@ def _config_to_string(config: Any) -> str:
     return stream.getvalue()
 
 
-def run_semgrep_on_example(lang: str, config_arg_str: str, code_path: str) -> str:
+def run_semgrep_on_example(
+    lang: str, config_arg_str: str, code_path: str
+) -> Optional[dict]:
     with tempfile.NamedTemporaryFile("w") as config:
         pattern_text = open(config_arg_str).read()
         config.write(_config_to_string(_single_pattern_to_dict(pattern_text, lang)))
         config.flush()
-        cmd = ["semgrep", "--json", f"--config={config.name}", code_path]
+        cmd = ["semgrep", "--strict", "--json", f"--config={config.name}", code_path]
         print(">>> " + " ".join(cmd))
         output = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if output.returncode == 0:
             print(output.stderr.decode("utf-8"))
-            return output.stdout.decode("utf-8")
+            return json.loads(output.stdout.decode("utf-8"))
         else:
             print("ERROR: " + str(output.returncode))
             print(cmd)
-            # sys.exit(1)
+            return None
 
 
 def invoke_semgrep_multi(semgrep_path, code_path, lang, category, subcategory):
-    result = run_semgrep_on_example(lang, semgrep_path, code_path)
+    if paths_exist(semgrep_path, code_path):
+        result = run_semgrep_on_example(lang, semgrep_path, code_path)
+    else:
+        result = {}
     return (
         semgrep_path,
         code_path,
@@ -227,20 +232,25 @@ def generate_cheatsheet(root_dir: str, html: bool):
         for lang in langs
         for category, subcategories in CHEATSHEET_ENTRIES.items()
         for subcategory in subcategories
-        if paths_exist(
-            find_path(root_dir, lang, category, subcategory, "sgrep"),
-            find_path(root_dir, lang, category, subcategory, lang_dir_to_ext(lang)),
-        )
     ]
     with multiprocessing.Pool(multiprocessing.cpu_count()) as pool:
         results = pool.starmap(invoke_semgrep_multi, semgrep_multi_args)
 
     for semgrep_path, code_path, lang, category, subcategory, result in results:
         highlights = []
-        if result:
-            j = json.loads(result)
-            for entry in j["results"]:
-                highlights.append({"start": entry["start"], "end": entry["end"]})
+        if result is None:
+            raise Exception(
+                f"rule '{code_path}' produced errors, please fix these before proceeding"
+            )
+        else:
+            if "results" in result and not result["results"]:
+                raise Exception(
+                    f"rule '{code_path}' produced no findings and is useless, please fix or TODO before proceeding"
+                )
+            highlights.extend(
+                {"start": r["start"], "end": r["end"]}
+                for r in result.get("results", [])
+            )
 
         entry = {
             "pattern": read_if_exists(semgrep_path),
@@ -498,7 +508,13 @@ def read_if_exists(path: Optional[str]):
 
 
 def lang_dir_to_ext(lang: str):
-    LANG_DIR_TO_EXT = {"python": "py", "ruby": "rb", "ocaml": "ml"}
+    LANG_DIR_TO_EXT = {
+        "python": "py",
+        "ruby": "rb",
+        "ocaml": "ml",
+        "csharp": "cs",
+        "rust": "rs",
+    }
     return LANG_DIR_TO_EXT.get(lang, lang)
 
 
@@ -602,7 +618,9 @@ def main() -> None:
     cheatsheet = generate_cheatsheet(args.directory, args.html)
 
     if args.json:
-        output = json.dumps(cheatsheet, indent=4, separators=(",", ": "))
+        output = json.dumps(
+            cheatsheet, indent=4, separators=(",", ": "), sort_keys=True
+        )
     elif args.html:
         output = cheatsheet_to_html(cheatsheet)
 

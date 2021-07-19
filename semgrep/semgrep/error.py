@@ -1,3 +1,5 @@
+import inspect
+import sys
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,7 @@ INVALID_LANGUAGE_EXIT_CODE = 8
 MATCH_TIMEOUT_EXIT_CODE = 9
 MATCH_MAX_MEMORY_EXIT_CODE = 10
 LEXICAL_ERROR_EXIT_CODE = 11
+TOO_MANY_MATCHES_EXIT_CODE = 12
 
 
 class Level(Enum):
@@ -56,6 +59,7 @@ class SemgrepError(Exception):
         return {
             "type": self.__class__.__name__,
             "code": self.code,
+            "level": self.level.name.lower(),
             **self.to_dict_base(),
         }
 
@@ -65,6 +69,13 @@ class SemgrepError(Exception):
         All values returned must be JSON serializable.
         """
         return {"message": str(self)}
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SemgrepError":  # type: ignore
+        """
+        Instantiates class from dict representation
+        """
+        return cls(**data)
 
 
 class SemgrepInternalError(Exception):
@@ -252,6 +263,27 @@ class InvalidPatternError(ErrorWithSpan):
 
 
 @attr.s(frozen=True, eq=True)
+class InvalidPatternErrorNoSpan(SemgrepError):
+    rule_id: str = attr.ib()
+    pattern: str = attr.ib()
+    language: str = attr.ib()
+
+    code = INVALID_PATTERN_EXIT_CODE
+    level = Level.ERROR
+
+    def __str__(self) -> str:
+        msg = f"Rule id: {self.rule_id} contains a pattern that could not be parsed as a pattern for language {self.language}: `{self.pattern}`"
+        return with_color(Fore.RED, msg)
+
+    def to_dict_base(self) -> Dict[str, Any]:
+        return {
+            "rule_id": self.rule_id,
+            "pattern": self.pattern,
+            "language": self.language,
+        }
+
+
+@attr.s(frozen=True, eq=True)
 class InvalidRuleSchemaError(ErrorWithSpan):
     code = INVALID_PATTERN_EXIT_CODE
     level = Level.ERROR
@@ -284,6 +316,25 @@ class MatchTimeoutError(SemgrepError):
 
     def __str__(self) -> str:
         msg = f"Warning: Semgrep exceeded timeout when running {self.rule_id} on {self.path}. See `--timeout` for more info."
+        return with_color(Fore.RED, msg)
+
+    def to_dict_base(self) -> Dict[str, Any]:
+        return {
+            "path": str(self.path),
+            "rule_id": self.rule_id,
+        }
+
+
+@attr.s(frozen=True, eq=True)
+class TooManyMatchesError(SemgrepError):
+    path: Path = attr.ib()
+    rule_id: str = attr.ib()
+
+    code = TOO_MANY_MATCHES_EXIT_CODE
+    level = Level.WARN
+
+    def __str__(self) -> str:
+        msg = f"Warning: Semgrep exceeded number of matches when running {self.rule_id} on {self.path}."
         return with_color(Fore.RED, msg)
 
     def to_dict_base(self) -> Dict[str, Any]:
@@ -337,3 +388,13 @@ class _UnknownLanguageError(SemgrepInternalError):
 
 class _UnknownExtensionError(SemgrepInternalError):
     pass
+
+
+# cf. https://stackoverflow.com/questions/1796180/how-can-i-get-a-list-of-all-classes-within-current-module-in-python/1796247#1796247
+ERROR_MAP = {
+    classname: classdef
+    for classname, classdef in inspect.getmembers(
+        sys.modules[__name__],
+        lambda member: inspect.isclass(member) and member.__module__ == __name__,
+    )
+}

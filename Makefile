@@ -24,37 +24,28 @@ endif
 #
 .PHONY: build
 build:
-	$(MAKE) build-spacegrep
 	$(MAKE) build-core
+	$(MAKE) -C toy-matcher
 	cd semgrep && pipenv install --dev
 
 .PHONY: install
 install:
-	$(MAKE) -C spacegrep install
 	$(MAKE) -C semgrep-core install
-	python3.7 -m pip install semgrep
+	python3 -m pip install semgrep
 
 .PHONY: build-core
-build-core: build-ocaml-tree-sitter
+build-core:
 	$(MAKE) -C semgrep-core
-
-.PHONY: build-ocaml-tree-sitter
-build-ocaml-tree-sitter:
-	$(MAKE) -C ocaml-tree-sitter
-	$(MAKE) -C ocaml-tree-sitter install
-
-.PHONY: build-spacegrep
-build-spacegrep:
-	$(MAKE) -C spacegrep
+	$(MAKE) -C semgrep-core install
 
 # Update and rebuild everything within the project.
 #
-# At the moment, this is useful when ocaml-tree-sitter get updated,
-# since semgrep-core is not rebuilt automatically when they change.
+# At the moment, this is useful when ocaml-tree-sitter gets updated,
+# since semgrep-core is not rebuilt automatically when it changes.
 #
 .PHONY: rebuild
 rebuild:
-	git submodule update --init --recursive
+	git submodule update --init
 	-$(MAKE) clean
 	$(MAKE) config
 	$(MAKE) build
@@ -64,13 +55,11 @@ rebuild:
 #
 .PHONY: setup
 setup:
-	git submodule update --init --recursive
+	git submodule update --init
 	opam update -y
-	opam install -y --deps-only ./semgrep-core/pfff
-	cd ocaml-tree-sitter && ./scripts/install-tree-sitter-lib
-	opam install -y --deps-only ./ocaml-tree-sitter
+	./scripts/install-tree-sitter-runtime
+	opam install -y --deps-only ./semgrep-core/src/pfff
 	opam install -y --deps-only ./semgrep-core
-	opam install -y --deps-only ./spacegrep
 
 # Install development dependencies in addition to build dependencies.
 #

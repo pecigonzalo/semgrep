@@ -1,1 +1,1 @@
-{"results": [], "errors": [{"type": "SemgrepError", "code": 2, "message": "invalid regular expression specified: missing ), unterminated subpattern at position 0"}]}
+{"errors": [{"code": 2, "level": "error", "message": "Invalid regexp in rule: '(abc': missing ) at position 4", "type": "SemgrepError"}], "results": []}

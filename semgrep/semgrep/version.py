@@ -1,17 +1,16 @@
-import logging
 import os
 import time
 from pathlib import Path
 from typing import Optional
-
-logger = logging.getLogger(__name__)
-
 
 from packaging.version import InvalidVersion
 from packaging.version import Version
 
 from semgrep import __VERSION__
 from semgrep.constants import SEMGREP_USER_AGENT
+from semgrep.verbose_logging import getLogger
+
+logger = getLogger(__name__)
 
 VERSION_CHECK_URL = str(
     os.environ.get("SEMGREP_VERSION_CHECK_URL", "https://semgrep.dev/api/check-version")

@@ -4,16 +4,11 @@ url = "https://pypi.org/simple"
 verify_ssl = true
 
 [dev-packages]
-pytest = "*"
-wheel = "*"
-tox = "*"
-pytest-snapshot = "*"
 appdirs = "*"
+pytest = "*"
+pytest-snapshot = "*"
 pytest-xdist = "*"
-xmldiff = "*"
+tox = "*"
 
 [packages]
 semgrep = {editable = true,path = "."}
-
-[requires]
-python_version = "3.7"

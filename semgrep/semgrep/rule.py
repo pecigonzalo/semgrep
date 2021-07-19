@@ -1,3 +1,5 @@
+import hashlib
+import json
 from typing import Any
 from typing import cast
 from typing import Dict
@@ -8,6 +10,7 @@ from typing import Tuple
 
 from semgrep.equivalences import Equivalence
 from semgrep.error import InvalidRuleSchemaError
+from semgrep.error import SemgrepError
 from semgrep.rule_lang import EmptySpan
 from semgrep.rule_lang import Span
 from semgrep.rule_lang import YamlMap
@@ -15,7 +18,9 @@ from semgrep.rule_lang import YamlTree
 from semgrep.semgrep_types import ALLOWED_GLOB_TYPES
 from semgrep.semgrep_types import BooleanRuleExpression
 from semgrep.semgrep_types import DEFAULT_MODE
+from semgrep.semgrep_types import JOIN_MODE
 from semgrep.semgrep_types import Language
+from semgrep.semgrep_types import Language_util
 from semgrep.semgrep_types import Mode
 from semgrep.semgrep_types import Operator
 from semgrep.semgrep_types import OPERATOR_PATTERN_NAMES_MAP
@@ -24,7 +29,6 @@ from semgrep.semgrep_types import OPERATORS_WITH_CHILDREN
 from semgrep.semgrep_types import pattern_names_for_operator
 from semgrep.semgrep_types import PATTERN_NAMES_OPERATOR_MAP
 from semgrep.semgrep_types import PatternId
-from semgrep.semgrep_types import REGEX_ONLY_LANGUAGE_KEYS
 from semgrep.semgrep_types import TAINT_MODE
 from semgrep.semgrep_types import YAML_TAINT_MUST_HAVE_KEYS
 
@@ -33,6 +37,8 @@ class Rule:
     def __init__(self, raw: YamlTree[YamlMap]) -> None:
         self._yaml = raw
         self._raw: Dict[str, Any] = raw.unroll_dict()
+
+        self._id = str(self._raw["id"])
 
         # For tracking errors from semgrep-core
         self._pattern_spans: Dict[PatternId, Span] = {}
@@ -56,17 +62,65 @@ class Rule:
             path_dict = paths_tree.unroll_dict()
         self._includes = path_dict.get("include", [])
         self._excludes = path_dict.get("exclude", [])
-        self._languages = [Language(l) for l in self._raw["languages"]]
+        rule_languages = {
+            Language_util.resolve(l, self.languages_span)
+            for l in self._raw.get("languages", [])
+        }
 
-        # add 'ts' to languages if the rule supports javascript.
-        if ("javascript" in self._languages) or ("js" in self._languages):
-            self._languages.append(Language("ts"))
+        # add typescript to languages if the rule supports javascript.
+        if any(language == Language.JAVASCRIPT for language in rule_languages):
+            rule_languages.add(Language.TYPESCRIPT)
+
+        self._languages = sorted(rule_languages, key=lambda lang: lang.value)  # type: ignore
 
         # check taint/search mode
-        self._expression, self._mode = self._build_search_patterns_for_mode(self._yaml)
+        if self._raw.get("mode") == JOIN_MODE:
+            self._mode = JOIN_MODE
+        else:
+            self._expression, self._mode = self._build_search_patterns_for_mode(
+                self._yaml
+            )
 
-        if any([lang in REGEX_ONLY_LANGUAGE_KEYS for lang in self._languages]):
+        if any(language == Language.REGEX for language in self._languages):
             self._validate_none_language_rule()
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, type(self)):
+            return False
+
+        return self._raw == other._raw
+
+    def __hash__(self) -> int:
+        return hash(self.id)
+
+    def has_pattern_where_python(self) -> bool:
+        """
+        Return true if this rule contains a pattern-where-python pattern
+        """
+
+        def _recursive_dict_key_exists(dictionary: Dict[str, Any], key: str) -> bool:
+            """
+            Returns true if
+            - dictionary contains key KEY or
+            - any value in dictionary that is a dict contains the key
+            - a value that is a list of dictionaries has a dict that contains the key
+            """
+            if key in dictionary:
+                return True
+
+            for val in dictionary.values():
+                if isinstance(val, dict) and _recursive_dict_key_exists(val, key):
+                    return True
+                if isinstance(val, list):
+                    for obj in val:
+                        if isinstance(obj, dict) and _recursive_dict_key_exists(
+                            obj, key
+                        ):
+                            return True
+
+            return False
+
+        return _recursive_dict_key_exists(self._raw, "pattern-where-python")
 
     def _validate_none_language_rule(self) -> None:
         """
@@ -77,11 +131,13 @@ class Rule:
             """
             Recursively validate expressions
             """
-            if expression.operator not in {
+            valid_operators = {
                 OPERATORS.REGEX,
                 OPERATORS.AND_EITHER,
                 OPERATORS.AND_ALL,
-            }:
+                OPERATORS.NOT_REGEX,
+            }
+            if expression.operator not in valid_operators:
                 operator_key = OPERATOR_PATTERN_NAMES_MAP.get(
                     expression.operator, [""]
                 )[0]
@@ -91,7 +147,7 @@ class Rule:
                     short_msg=f"invalid pattern clause",
                     long_msg=f"invalid pattern clause '{operator_key}' with regex-only rules",
                     spans=[span],
-                    help=f"use only patterns, pattern-regex, or pattern-either with regex-only rules",
+                    help=f"use only patterns, pattern-either, pattern-regex, or pattern-not-regex with regex-only rules",
                 )
             if expression.children:
                 for child in expression.children:
@@ -127,10 +183,9 @@ class Rule:
         Move through the expression from the YML, yielding tuples of (operator, unique-id-for-pattern, pattern)
         """
         for rule_index, pattern_tree in enumerate(rule_patterns.value):
-            pattern = pattern_tree.value
-            for boolean_operator_yaml, sub_pattern in pattern.items():
+            for boolean_operator_yaml, sub_pattern in pattern_tree.value.items():
                 operator = operator_for_pattern_name(boolean_operator_yaml)
-                if operator in set(OPERATORS_WITH_CHILDREN):
+                if operator in OPERATORS_WITH_CHILDREN:
                     sub_expression = self._parse_boolean_expression(
                         sub_pattern, 0, f"{prefix}.{rule_index}.{pattern_id_idx}"
                     )
@@ -141,25 +196,20 @@ class Rule:
                         operand=None,
                     )
                 else:
-                    pattern_text, pattern_span = sub_pattern.value, sub_pattern.span
-
-                    if isinstance(pattern_text, YamlMap):
-                        pattern_text = {
-                            k.value: v.value for k, v in pattern_text.items()
-                        }
-
-                    if isinstance(pattern_text, str) or isinstance(pattern_text, dict):
-                        pattern_id = PatternId(f"{prefix}.{pattern_id_idx}")
-                        self._pattern_spans[pattern_id] = pattern_span
-                        yield BooleanRuleExpression(
-                            operator=operator,
-                            pattern_id=pattern_id,
-                            children=None,
-                            operand=pattern_text,
+                    if not isinstance(sub_pattern.value, (str, YamlMap)):
+                        raise SemgrepError(
+                            f"expected operator '{operator}' to have string or map value guaranteed by schema"
                         )
-                        pattern_id_idx += 1
-                    else:
-                        raise Exception("Internal error: bad schema")
+
+                    pattern_id = PatternId(f"{prefix}.{pattern_id_idx}")
+                    self._pattern_spans[pattern_id] = sub_pattern.span
+                    yield BooleanRuleExpression(
+                        operator=operator,
+                        pattern_id=pattern_id,
+                        children=None,
+                        operand=sub_pattern.value,
+                    )
+                    pattern_id_idx += 1
 
     def _build_taint_expression(self, rule: YamlTree[YamlMap]) -> BooleanRuleExpression:
         """
@@ -167,11 +217,12 @@ class Rule:
         """
         rule_raw = rule.value
         _rule_id = cast(str, rule_raw["id"].unroll())
-
         rule_id = PatternId(_rule_id)
+
         for pattern_name in YAML_TAINT_MUST_HAVE_KEYS:
             pattern = rule_raw[pattern_name]
             self._pattern_spans[rule_id] = pattern.span
+
         return BooleanRuleExpression(
             OPERATORS.AND,
             rule_id,
@@ -188,6 +239,7 @@ class Rule:
         rule_raw = rule.value
         _rule_id = cast(str, rule_raw["id"].unroll())
         rule_id = PatternId(_rule_id)
+
         for pattern_name in pattern_names_for_operator(OPERATORS.AND):
             pattern = rule_raw.get(pattern_name)
             if pattern:
@@ -224,7 +276,7 @@ class Rule:
                     operand=None,
                 )
 
-        raise Exception("Internal error: bad schema")
+        raise SemgrepError(f"rule with id '{_rule_id}' is missing top-level operator")
 
     @property
     def includes(self) -> List[str]:
@@ -236,7 +288,7 @@ class Rule:
 
     @property
     def id(self) -> str:
-        return str(self._raw["id"])
+        return self._id
 
     @property
     def message(self) -> str:
@@ -253,26 +305,6 @@ class Rule:
     @property
     def mode(self) -> str:
         return self._mode
-
-    @property
-    def sarif_severity(self) -> str:
-        """
-        SARIF v2.1.0-compliant severity string.
-
-        See https://github.com/oasis-tcs/sarif-spec/blob/a6473580/Schemata/sarif-schema-2.1.0.json#L1566
-        """
-        mapping = {"INFO": "note", "ERROR": "error", "WARNING": "warning"}
-        return mapping[self.severity]
-
-    @property
-    def sarif_tags(self) -> Iterator[str]:
-        """
-        Tags to display on SARIF-compliant UIs, such as GitHub security scans.
-        """
-        if "cwe" in self.metadata:
-            yield self.metadata["cwe"]
-        if "owasp" in self.metadata:
-            yield f"OWASP-{self.metadata['owasp']}"
 
     @property
     def languages(self) -> List[Language]:
@@ -315,34 +347,24 @@ class Rule:
     def from_yamltree(cls, rule_yaml: YamlTree[YamlMap]) -> "Rule":
         return cls(rule_yaml)
 
-    def to_json(self) -> Dict[str, Any]:
-        return self._raw
-
-    def to_sarif(self) -> Dict[str, Any]:
-        return {
-            "id": self.id,
-            "name": self.id,
-            "shortDescription": {"text": self.message},
-            "fullDescription": {"text": self.message},
-            "defaultConfiguration": {"level": self.sarif_severity},
-            "properties": {"precision": "very-high", "tags": list(self.sarif_tags)},
-        }
-
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__} id={self.id}>"
 
-    def with_id(self, new_id: str) -> "Rule":
-        new_yaml = YamlTree(
-            value=YamlMap(dict(self._yaml.value._internal)), span=self._yaml.span
-        )
-        new_yaml.value[self._yaml.value.key_tree("id")] = YamlTree(
-            value=new_id, span=new_yaml.value["id"].span
-        )
-        return Rule(new_yaml)
+    def rename_id(self, new_id: str) -> None:
+        self._id = new_id
 
     @property
     def pattern_spans(self) -> Dict[PatternId, Span]:
         return self._pattern_spans
+
+    @property
+    def full_hash(self) -> str:
+        """
+        sha256 hash of the whole rule object instead of just the id
+        """
+        return hashlib.sha256(
+            json.dumps(self._raw, sort_keys=True).encode()
+        ).hexdigest()
 
 
 def operator_for_pattern_name(pattern_name: YamlTree[str]) -> Operator:

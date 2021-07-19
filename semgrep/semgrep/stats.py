@@ -4,9 +4,8 @@ from typing import Any
 from typing import cast
 from typing import Dict
 from typing import Set
-from typing import Tuple
 
-from semgrep.target_manager_extensions import ext_to_langs
+from semgrep.target_manager_extensions import ext_to_lang
 from semgrep.target_manager_extensions import FileExtension
 from semgrep.target_manager_extensions import Language
 
@@ -29,7 +28,7 @@ def make_target_stats(all_targets: Set[Path]) -> Dict[str, Any]:
         suffix: FileExtension = cast(FileExtension, path.suffix)
         extensions[suffix] += 1
         # an extension could map to multiple languages; just take the first one
-        lang = sorted(ext_to_langs(suffix))[0]
+        lang = ext_to_lang(suffix)
         languages[lang] += 1
 
     return {
@@ -60,7 +59,3 @@ def count_lines_by_path_extension(paths: Set[Path]) -> Dict[FileExtension, int]:
     for p, count in all_counts.items():
         by_extension[cast(FileExtension, p.suffix)] += count
     return dict(by_extension)
-
-
-def make_runtime_per_stats(rule_matches: Any) -> Dict[str, Any]:
-    pass

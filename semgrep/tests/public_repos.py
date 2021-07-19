@@ -209,7 +209,6 @@ PASSING_REPOS = [
         "repo": "https://github.com/returntocorp/semgrep-rules",
         "languages": ALL_LANGUAGES,
     },
-    {"repo": "https://github.com/coinbase/btcexport", "languages": ALL_LANGUAGES},
     {"repo": "https://github.com/seemoo-lab/opendrop", "languages": ALL_LANGUAGES},
     {
         "repo": "https://github.com/lightstep/lightstep-tracer-python",
@@ -252,7 +251,6 @@ PASSING_REPOS = [
     {"repo": "https://github.com/dropbox/godropbox", "languages": ALL_LANGUAGES},
     {"repo": "https://github.com/dropbox/trapperkeeper", "languages": ALL_LANGUAGES},
     {"repo": "https://github.com/lodash/lodash", "languages": ALL_LANGUAGES},
-    {"repo": "https://github.com/zulip/zulip", "languages": ALL_LANGUAGES},
     {
         "repo": "https://github.com/home-assistant/home-assistant",
         "languages": ALL_LANGUAGES,
@@ -264,32 +262,40 @@ PASSING_REPOS = [
         "languages": ALL_LANGUAGES,
     },
     {
-        "repo": "https://github.com/we45/Vulnerable-Flask-App",
-        "languages": ALL_LANGUAGES,
-    },
-    {
         "repo": "https://github.com/jekyll/jekyll",
         "languages": ALL_LANGUAGES,
     },
     {"repo": "https://github.com/OWASP/NodeGoat", "languages": ALL_LANGUAGES},
     {"repo": "https://github.com/dropbox/questions", "languages": ALL_LANGUAGES},
+    {"repo": "https://github.com/coinbase/gtt-ui", "languages": ALL_LANGUAGES},
+    {"repo": "https://github.com/DevSlop/Pixi", "languages": ALL_LANGUAGES},
+    # Excluding cause of https://github.com/returntocorp/semgrep/issues/2613
+    {
+        "repo": "https://github.com/zulip/zulip",
+        "languages": ALL_LANGUAGES,
+        "excludes": ["frontend_tests/puppeteer_lib/common.ts"],
+    },
 ]
 
 FAILING_REPOS = [
+    # this fails in some CI, but works locally, weird
+    #    xfail_repo(
+    #        {
+    #            "repo": "https://github.com/we45/Vulnerable-Flask-App",
+    #            "languages": ALL_LANGUAGES,
+    #        },
+    #        reason="MatchTimeout error but happens only in CI",
+    #    ),
+    xfail_repo(
+        {"repo": "https://github.com/rails/rails", "languages": ["ruby"]},
+        reason="https://github.com/tree-sitter/tree-sitter-ruby/issues/167",
+    ),
     xfail_repo(
         {
             "repo": "https://github.com/highcharts/highcharts",
             "languages": ALL_LANGUAGES,
         },
         reason="javascript parse error, probably due to '?.01' regression in minified file",
-    ),
-    xfail_repo(
-        {"repo": "https://github.com/coinbase/gtt-ui", "languages": ALL_LANGUAGES},
-        reason="javascript parse error, probably due to ?. regression",
-    ),
-    xfail_repo(
-        {"repo": "https://github.com/DevSlop/Pixi", "languages": ALL_LANGUAGES},
-        reason="javascript parse error, probably due to ?. regression",
     ),
     xfail_repo(
         {
@@ -324,10 +330,12 @@ FAILING_REPOS = [
         reason="https://www.oreilly.com/library/view/javascript-the-definitive/9781449393854/ch11s06.html",
     ),
     xfail_repo(
-        {"repo": "https://github.com/dropbox/notouch", "languages": ALL_LANGUAGES},
+        {
+            "repo": "https://github.com/dropbox/notouch",
+            "languages": ALL_LANGUAGES,
+        },
         reason="indented comment on last line python",
     ),
-    xfail_repo({"repo": "https://github.com/rails/rails", "languages": ["ruby"]}),
     xfail_repo(
         {
             "repo": "https://github.com/rapid7/metasploit-framework",
@@ -336,13 +344,13 @@ FAILING_REPOS = [
     ),
     xfail_repo({"repo": "https://github.com/Homebrew/brew", "languages": ["ruby"]}),
     xfail_repo({"repo": "https://github.com/gitlabhq/gitlabhq", "languages": ["ruby"]}),
-    xfail_repo(
-        {
-            "repo": "https://github.com/coinbase/coinbase-pro-node",
-            "languages": ["javascript", "typescript"],
-        },
-        reason=("Failure to parse typescript"),
-    ),
+    #    xfail_repo(
+    #        {
+    #            "repo": "https://github.com/coinbase/coinbase-pro-node",
+    #            "languages": ["javascript", "typescript"],
+    #        },
+    #        reason=("Failure to parse typescript"),
+    #    ),
     xfail_repo(
         {
             "repo": "https://github.com/bkimminich/juice-shop",

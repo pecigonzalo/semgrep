@@ -7,9 +7,12 @@ from typing import Set
 from unittest.mock import MagicMock
 from unittest.mock import PropertyMock
 
-from semgrep.constants import RCE_RULE_FLAG
+import pytest
+
+from semgrep.error import SemgrepError
 from semgrep.evaluation import enumerate_patterns_in_boolean_expression
 from semgrep.evaluation import evaluate_expression as raw_evaluate_expression
+from semgrep.evaluation import interpolate_string_with_metavariables
 from semgrep.pattern_match import PatternMatch
 from semgrep.rule import Rule
 from semgrep.semgrep_types import BooleanRuleExpression
@@ -22,12 +25,12 @@ from semgrep.semgrep_types import Range
 def evaluate_expression(
     exprs: List[BooleanRuleExpression],
     pattern_ids_to_pattern_matches: Dict[PatternId, List[PatternMatch]],
-    flags: Optional[Dict[str, Any]] = None,
+    allow_exec: bool = False,
 ) -> Set[Range]:
     # convert it to an implicit and
     e = BooleanRuleExpression(OPERATORS.AND_ALL, None, exprs, None)
     result: Set[Range] = raw_evaluate_expression(
-        e, pattern_ids_to_pattern_matches, [], flags
+        e, pattern_ids_to_pattern_matches, [], allow_exec=allow_exec
     )
     return result
 
@@ -35,11 +38,22 @@ def evaluate_expression(
 def PatternMatchMock(
     start: int, end: int, metavars: Optional[Dict[str, Any]] = None
 ) -> PatternMatch:
+    if metavars is None:
+        metavars = {}
+
     mock = MagicMock()
-    range_property = PropertyMock(return_value=Range(start, end, metavars or {}))
+
+    range_property = PropertyMock(return_value=Range(start, end, metavars))
     type(mock).range = range_property
+
     metavars_property = PropertyMock(return_value=metavars)
-    type(mock).metavars = metavars_property
+    type(mock).metavariables = metavars_property
+
+    def mocked_get_metavariable_value(metavariable: str) -> Any:
+        return metavars[metavariable]["abstract_content"] if metavars else ""
+
+    mock.get_metavariable_value = mocked_get_metavariable_value
+
     return mock
 
 
@@ -481,5 +495,82 @@ def test_evaluate_python() -> None:
         ),
     ]
 
-    result = evaluate_expression(expression, results, flags={RCE_RULE_FLAG: True})
+    result = evaluate_expression(expression, results, allow_exec=True)
     assert result == set([Range(400, 500, {})]), f"{result}"
+
+
+def test_evaluate_python_exec_false() -> None:
+    results = {
+        PatternId("all_execs"): [
+            PatternMatchMock(400, 500, {"$X": {"abstract_content": "cmd_pattern"}}),
+            PatternMatchMock(800, 900, {"$X": {"abstract_content": "other_pattern"}}),
+        ]
+    }
+
+    expression = [
+        BooleanRuleExpression(OPERATORS.AND, PatternId("all_execs"), None, "all_execs"),
+        BooleanRuleExpression(
+            OPERATORS.WHERE_PYTHON,
+            PatternId("p1"),
+            None,
+            "vars['$X'].startswith('cmd')",
+        ),
+    ]
+
+    with pytest.raises(SemgrepError):
+        evaluate_expression(expression, results, allow_exec=False)
+
+
+def test_evaluate_python_bad_return_type() -> None:
+    results = {
+        PatternId("all_execs"): [
+            PatternMatchMock(400, 500, {"$X": {"abstract_content": "cmd_pattern"}}),
+            PatternMatchMock(800, 900, {"$X": {"abstract_content": "other_pattern"}}),
+        ]
+    }
+
+    expression = [
+        BooleanRuleExpression(OPERATORS.AND, PatternId("all_execs"), None, "all_execs"),
+        BooleanRuleExpression(
+            OPERATORS.WHERE_PYTHON,
+            PatternId("p1"),
+            None,
+            "str(vars['$X'])",
+        ),
+    ]
+
+    with pytest.raises(SemgrepError):
+        evaluate_expression(expression, results, allow_exec=True)
+
+
+def test_single_pattern_match_filtering() -> None:
+    results = {
+        PatternId("pattern1"): [PatternMatchMock(30, 100, {"$X": "x1", "$Y": "y1"})],
+        PatternId("pattern2"): [PatternMatchMock(30, 100, {"$X": "x1", "$Y": "y2"})],
+        PatternId("pattern3"): [PatternMatchMock(30, 100, {"$X": "x1"})],
+    }
+    expression = [
+        BooleanRuleExpression(
+            OPERATORS.AND_EITHER,
+            None,
+            [RuleExpr(OPERATORS.AND, "pattern1"), RuleExpr(OPERATORS.AND, "pattern2")],
+        ),
+        RuleExpr(OPERATORS.AND_NOT, "pattern3"),
+    ]
+    result = evaluate_expression(expression, results)
+    assert result == set(), f"{result}"
+
+
+def test_interpolation() -> None:
+    pattern_match = PatternMatchMock(
+        0,
+        100,
+        {"$X": {"abstract_content": "VALUE1"}, "$X2": {"abstract_content": "VALUE2"}},
+    )
+
+    text = "Expect $X to be VALUE1 and $X2 to be VALUE2"
+    expected = "Expect VALUE1 to be VALUE1 and VALUE2 to be VALUE2"
+
+    result = interpolate_string_with_metavariables(text, pattern_match, {})
+
+    assert result == expected

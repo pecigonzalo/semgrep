@@ -1,15 +1,18 @@
-import logging
 import os
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 from typing import Dict
+from typing import IO
 from typing import List
 from typing import Optional
 from typing import Tuple
 
+from ruamel.yaml import YAML
 from ruamel.yaml import YAMLError
 
+from semgrep.constants import CLI_RULE_ID
 from semgrep.constants import DEFAULT_CONFIG_FILE
 from semgrep.constants import DEFAULT_CONFIG_FOLDER
 from semgrep.constants import DEFAULT_SEMGREP_CONFIG_NAME
@@ -18,7 +21,6 @@ from semgrep.constants import PLEASE_FILE_ISSUE_TEXT
 from semgrep.constants import RULES_KEY
 from semgrep.constants import SEMGREP_URL
 from semgrep.constants import SEMGREP_USER_AGENT
-from semgrep.constants import YML_EXTENSIONS
 from semgrep.error import InvalidRuleSchemaError
 from semgrep.error import SemgrepError
 from semgrep.error import UNPARSEABLE_YAML_EXIT_CODE
@@ -27,9 +29,11 @@ from semgrep.rule_lang import parse_yaml_preserve_spans
 from semgrep.rule_lang import Span
 from semgrep.rule_lang import YamlMap
 from semgrep.rule_lang import YamlTree
+from semgrep.util import is_config_suffix
 from semgrep.util import is_url
+from semgrep.verbose_logging import getLogger
 
-logger = logging.getLogger(__name__)
+logger = getLogger(__name__)
 
 IN_DOCKER = "SEMGREP_IN_DOCKER" in os.environ
 IN_GH_ACTION = "GITHUB_WORKSPACE" in os.environ
@@ -37,14 +41,21 @@ IN_GH_ACTION = "GITHUB_WORKSPACE" in os.environ
 SRC_DIRECTORY = Path(os.environ.get("SEMGREP_SRC_DIRECTORY", Path("/") / "src"))
 OLD_SRC_DIRECTORY = Path("/") / "home" / "repo"
 
-TEMPLATE_YAML_URL = (
-    "https://raw.githubusercontent.com/returntocorp/semgrep-rules/develop/template.yaml"
-)
-
 RULES_REGISTRY = {"r2c": "https://semgrep.dev/c/p/r2c"}
-DEFAULT_REGISTRY_KEY = "r2c"
 
 MISSING_RULE_ID = "no-rule-id"
+
+DEFAULT_CONFIG = {
+    "rules": [
+        {
+            "id": "eqeq-is-bad",
+            "pattern": "$X == $X",
+            "message": "$X == $X is a useless equality check",
+            "languages": ["python"],
+            "severity": "ERROR",
+        },
+    ],
+}
 
 
 class Config:
@@ -87,7 +98,7 @@ class Config:
                 # Patch config_id to fix https://github.com/returntocorp/semgrep/issues/1912
                 resolved_config = resolve_config(config)
                 if not resolved_config:
-                    logger.debug(f"Could not resolve config for {config}. Skipping.")
+                    logger.verbose(f"Could not resolve config for {config}. Skipping.")
                     continue
 
                 for (
@@ -117,9 +128,11 @@ class Config:
         configs = self.valid
         if not no_rewrite_rule_ids:
             # re-write the configs to have the hierarchical rule ids
-            configs = self._rename_rule_ids(configs)
+            self._rename_rule_ids(configs)
 
-        return [rule for rules in configs.values() for rule in rules]
+        return list(
+            OrderedDict.fromkeys([rule for rules in configs.values() for rule in rules])
+        )
 
     @staticmethod
     def _safe_relative_to(a: Path, b: Path) -> Path:
@@ -140,16 +153,12 @@ class Config:
         return prefix
 
     @staticmethod
-    def _rename_rule_ids(valid_configs: Dict[str, List[Rule]]) -> Dict[str, List[Rule]]:
-        transformed = {}
+    def _rename_rule_ids(valid_configs: Dict[str, List[Rule]]) -> None:
         for config_id, rules in valid_configs.items():
-            transformed[config_id] = [
-                rule.with_id(
+            for rule in rules:
+                rule.rename_id(
                     f"{Config._convert_config_id_to_prefix(config_id)}{rule.id or MISSING_RULE_ID}"
                 )
-                for rule in rules
-            ]
-        return transformed
 
     # the mypy ignore is cause YamlTree puts an Any inside the @staticmethod decorator
     @staticmethod
@@ -217,7 +226,7 @@ def manual_config(pattern: str, lang: str) -> Dict[str, YamlTree]:
             {
                 RULES_KEY: [
                     {
-                        ID_KEY: "-",
+                        ID_KEY: CLI_RULE_ID,
                         "pattern": pattern_tree,
                         "message": pattern,
                         "languages": [lang],
@@ -254,7 +263,7 @@ def adjust_for_docker() -> None:
 
 
 def get_base_path() -> Path:
-    return Path(".")
+    return Path(os.curdir)
 
 
 def indent(msg: str) -> str:
@@ -297,7 +306,8 @@ def parse_config_folder(loc: Path, relative: bool = False) -> Dict[str, YamlTree
     configs = {}
     for l in loc.rglob("*"):
         # Allow manually specified paths with ".", but don't auto-expand them
-        if not _is_hidden_config(l.relative_to(loc)) and l.suffix in YML_EXTENSIONS:
+        correct_suffix = is_config_suffix(l)
+        if not _is_hidden_config(l.relative_to(loc)) and correct_suffix:
             if l.is_file():
                 configs.update(parse_config_at_path(l, loc if relative else None))
     return configs
@@ -309,8 +319,8 @@ def _is_hidden_config(loc: Path) -> bool:
     Also want to keep src/.semgrep/bad_pattern.yml but not ./.pre-commit-config.yaml
     """
     return any(
-        part != "."
-        and part != ".."
+        part != os.curdir
+        and part != os.pardir
         and part.startswith(".")
         and DEFAULT_SEMGREP_CONFIG_NAME not in part
         for part in loc.parts
@@ -348,7 +358,7 @@ def load_config_from_local_path(location: str) -> Dict[str, YamlTree]:
     else:
         addendum = ""
         if IN_DOCKER:
-            addendum = " (since you are running in docker, you cannot specify arbitary paths on the host; they must be mounted into the container)"
+            addendum = " (since you are running in docker, you cannot specify arbitrary paths on the host; they must be mounted into the container)"
         raise SemgrepError(
             f"unable to find a config; path `{loc}` does not exist{addendum}"
         )
@@ -381,7 +391,7 @@ def download_config(config_url: str) -> Dict[str, YamlTree]:
     headers = {"User-Agent": SEMGREP_USER_AGENT}
 
     try:
-        r = requests.get(config_url, stream=True, headers=headers, timeout=10)
+        r = requests.get(config_url, stream=True, headers=headers, timeout=20)
         if r.status_code == requests.codes.ok:
             content_type = r.headers.get("Content-Type")
             yaml_types = [
@@ -394,7 +404,7 @@ def download_config(config_url: str) -> Dict[str, YamlTree]:
             if content_type and any((ct in content_type for ct in yaml_types)):
                 return parse_config_string(
                     "remote-url",
-                    r.content.decode("utf-8"),
+                    r.content.decode("utf-8", errors="replace"),
                     filename=f"{config_url[:20]}...",
                 )
             else:
@@ -457,34 +467,36 @@ def resolve_config(config_str: str) -> Dict[str, YamlTree]:
     return config
 
 
-def generate_config() -> None:
-    import requests  # here for faster startup times
+def generate_config(fd: IO, lang: Optional[str], pattern: Optional[str]) -> None:
+    config = DEFAULT_CONFIG
 
-    # defensive coding
-    if Path(DEFAULT_CONFIG_FILE).exists():
-        raise SemgrepError(
-            f"{DEFAULT_CONFIG_FILE} already exists. Please remove and try again"
-        )
+    if lang:
+        config["rules"][0]["languages"] = [lang]
+    if pattern:
+        config["rules"][0]["pattern"] = pattern
+
+    yaml = YAML()
+
     try:
-        r = requests.get(TEMPLATE_YAML_URL, timeout=10)
-        r.raise_for_status()
-        template_str = r.text
-    except Exception as e:
-        logger.debug(str(e))
-        logger.warning(
-            f"There was a problem downloading the latest template config. Using fallback template"
-        )
-        template_str = """rules:
-  - id: eqeq-is-bad
-    pattern: $X == $X
-    message: "$X == $X is a useless equality check"
-    languages: [python]
-    severity: ERROR"""
-    try:
-        with open(DEFAULT_CONFIG_FILE, "w") as template:
-            template.write(template_str)
-            logger.info(
-                f"Template config successfully written to {DEFAULT_CONFIG_FILE}"
-            )
+        yaml.dump(config, fd)
+        logger.info(f"Template config successfully written to {fd.name}")
     except Exception as e:
         raise SemgrepError(str(e))
+
+
+def get_config(
+    pattern: str, lang: str, config_strs: List[str]
+) -> Tuple[Config, List[SemgrepError]]:
+    if pattern:
+        if not lang:
+            raise SemgrepError("language must be specified when a pattern is passed")
+        config, errors = Config.from_pattern_lang(pattern, lang)
+    else:
+        config, errors = Config.from_config_list(config_strs)
+
+    if not config:
+        raise SemgrepError(
+            f"No config given and {DEFAULT_CONFIG_FILE} was not found. Try running with --help to debug or if you want to download a default config, try running with --config r2c"
+        )
+
+    return config, errors

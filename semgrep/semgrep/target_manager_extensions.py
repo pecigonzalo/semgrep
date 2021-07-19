@@ -1,21 +1,18 @@
-from typing import Any
-from typing import cast
 from typing import Dict
 from typing import List
-from typing import NewType
-from typing import Set
-from typing import Tuple
-from typing import TypeVar
 
 from semgrep.error import _UnknownExtensionError
 from semgrep.error import _UnknownLanguageError
-from semgrep.semgrep_types import GENERIC_LANGUAGE
+from semgrep.semgrep_types import FileExtension
 from semgrep.semgrep_types import Language
-from semgrep.semgrep_types import REGEX_ONLY_LANGUAGE_KEYS
+from semgrep.semgrep_types import Language_util
 
 
-FileExtension = NewType("FileExtension", str)
-
+# coupling: if you add a constant here, modify also ALL_EXTENSIONS below
+# and you probably also need to update semgrep_types.py Language
+# and Language_util classes.
+# You may also have to regenerate some test snapshots with
+# pipenv run pytest tests/e2e/test_rule_parser.py --snapshot-update
 PYTHON_EXTENSIONS = [FileExtension(".py"), FileExtension(".pyi")]
 JAVASCRIPT_EXTENSIONS = [FileExtension(".js"), FileExtension(".jsx")]
 TYPESCRIPT_EXTENSIONS = [FileExtension(".ts"), FileExtension(".tsx")]
@@ -24,11 +21,16 @@ C_EXTENSIONS = [FileExtension(".c")]
 GO_EXTENSIONS = [FileExtension(".go")]
 RUBY_EXTENSIONS = [FileExtension(".rb")]
 PHP_EXTENSIONS = [FileExtension(".php")]
-ML_EXTENSIONS = [
-    FileExtension(".mli"),
-    FileExtension(".ml"),
-]
+LUA_EXTENSIONS = [FileExtension(".lua")]
+CSHARP_EXTENSIONS = [FileExtension(".cs")]
+RUST_EXTENSIONS = [FileExtension(".rs")]
+KOTLIN_EXTENSIONS = [FileExtension(".kt"), FileExtension(".kts"), FileExtension(".ktm")]
+YAML_EXTENSIONS = [FileExtension(".yaml"), FileExtension(".yml")]
+ML_EXTENSIONS = [FileExtension(".mli"), FileExtension(".ml")]
 JSON_EXTENSIONS = [FileExtension(".json")]
+SCALA_EXTENSIONS = [FileExtension(".scala")]
+VUE_EXTENSIONS = [FileExtension(".vue")]
+HTML_EXTENSIONS = [FileExtension(".html"), FileExtension(".html")]
 
 # This is used to determine the set of files with known extensions,
 # i.e. those for which we have a proper parser.
@@ -42,6 +44,12 @@ ALL_EXTENSIONS = (
     + RUBY_EXTENSIONS
     + ML_EXTENSIONS
     + JSON_EXTENSIONS
+    + RUST_EXTENSIONS
+    + KOTLIN_EXTENSIONS
+    + YAML_EXTENSIONS
+    + SCALA_EXTENSIONS
+    + VUE_EXTENSIONS
+    + HTML_EXTENSIONS
 )
 
 # This is used to select the files suitable for spacegrep, which is
@@ -49,42 +57,51 @@ ALL_EXTENSIONS = (
 # files.
 GENERIC_EXTENSIONS = [FileExtension("")]
 
-T = TypeVar("T")
+_LANGS_TO_EXTS: Dict[Language, List[FileExtension]] = {
+    Language.PYTHON: PYTHON_EXTENSIONS,
+    Language.PYTHON2: PYTHON_EXTENSIONS,
+    Language.PYTHON3: PYTHON_EXTENSIONS,
+    Language.JAVASCRIPT: JAVASCRIPT_EXTENSIONS,
+    Language.TYPESCRIPT: TYPESCRIPT_EXTENSIONS,
+    Language.JAVA: JAVA_EXTENSIONS,
+    Language.C: C_EXTENSIONS,
+    Language.GO: GO_EXTENSIONS,
+    Language.ML: ML_EXTENSIONS,
+    Language.RUBY: RUBY_EXTENSIONS,
+    Language.PHP: PHP_EXTENSIONS,
+    Language.JSON: JSON_EXTENSIONS,
+    Language.LUA: LUA_EXTENSIONS,
+    Language.CSHARP: CSHARP_EXTENSIONS,
+    Language.RUST: RUST_EXTENSIONS,
+    Language.KOTLIN: KOTLIN_EXTENSIONS,
+    Language.YAML: YAML_EXTENSIONS,
+    Language.REGEX: GENERIC_EXTENSIONS,
+    Language.GENERIC: GENERIC_EXTENSIONS,
+    Language.SCALA: SCALA_EXTENSIONS,
+    Language.VUE: VUE_EXTENSIONS,
+    Language.HTML: HTML_EXTENSIONS,
+}
 
 
-def langauge_set(s: Set[str]) -> Set[Language]:
-    # hack to make mypy accept our Set[str] as a set of Language
-    return s  # type:ignore
+def all_supported_languages() -> List[str]:
+    """
+    We want the list of languages to be deterministic, so sort it
+    """
+    return Language_util.all_language_strs()
 
-
-# don't use this directly because it won't be O(1) lookup
-# it's just for human readability, we process it below
-_LANGS_TO_EXTS_INTERNAL: List[Tuple[Set[Language], List[FileExtension]]] = [
-    (langauge_set({"python", "python2", "python3", "py"}), PYTHON_EXTENSIONS),
-    (langauge_set({"js", "jsx", "javascript"}), JAVASCRIPT_EXTENSIONS),
-    (langauge_set({"ts", "tsx", "typescript"}), TYPESCRIPT_EXTENSIONS),
-    (langauge_set({"java"}), JAVA_EXTENSIONS),
-    (langauge_set({"c"}), C_EXTENSIONS),
-    (langauge_set({"go", "golang"}), GO_EXTENSIONS),
-    (langauge_set({"ml", "ocaml"}), ML_EXTENSIONS),
-    (langauge_set({"rb", "ruby"}), RUBY_EXTENSIONS),
-    (langauge_set({"php"}), PHP_EXTENSIONS),
-    (langauge_set({"json", "JSON", "Json"}), JSON_EXTENSIONS),
-    (REGEX_ONLY_LANGUAGE_KEYS.union({GENERIC_LANGUAGE}), GENERIC_EXTENSIONS),
-]
 
 # create a dictionary for fast lookup and reverse lookup
-_LANGS_TO_EXTS: Dict[Language, List[FileExtension]] = {}
-_EXTS_TO_LANGS: Dict[FileExtension, List[Language]] = {}
-for language_set, extensions in _LANGS_TO_EXTS_INTERNAL:
-    for lang in language_set:
-        _LANGS_TO_EXTS[lang] = extensions
-    for extension in extensions:
-        _EXTS_TO_LANGS[extension] = list(language_set)
+_EXTS_TO_LANG: Dict[FileExtension, Language] = {}
+for language in _LANGS_TO_EXTS.keys():
+    for extension in _LANGS_TO_EXTS[language]:
+        # When there are multiple languages for an extension,
+        # take the first one
+        if not extension in _EXTS_TO_LANG:
+            _EXTS_TO_LANG[extension] = language
 
 
-def ext_to_langs(ext: FileExtension) -> List[Language]:
-    langs = _EXTS_TO_LANGS.get(ext)
+def ext_to_lang(ext: FileExtension) -> Language:
+    langs = _EXTS_TO_LANG.get(ext)
     if langs is None:
         raise _UnknownExtensionError(f"Unsupported extension: {ext}")
     return langs

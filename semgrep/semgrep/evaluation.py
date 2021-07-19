@@ -1,18 +1,20 @@
-import logging
+import copy
 import re
 from collections import defaultdict
-from pathlib import Path
+from collections import OrderedDict
 from typing import Any
-from typing import cast
+from typing import Callable
 from typing import Dict
 from typing import Iterable
 from typing import List
 from typing import Optional
 from typing import Set
 from typing import Tuple
+from typing import Union
 
-logger = logging.getLogger(__name__)
+import attr
 
+from semgrep.constants import BREAK_LINE
 from semgrep.constants import RCE_RULE_FLAG
 from semgrep.error import NEED_ARBITRARY_CODE_EXEC_EXIT_CODE
 from semgrep.error import SemgrepError
@@ -20,15 +22,89 @@ from semgrep.error import UnknownOperatorError
 from semgrep.metavariable_comparison import metavariable_comparison
 from semgrep.pattern_match import PatternMatch
 from semgrep.rule import Rule
+from semgrep.rule_lang import YamlMap
 from semgrep.rule_match import RuleMatch
 from semgrep.semgrep_types import BooleanRuleExpression
 from semgrep.semgrep_types import OPERATORS
+from semgrep.semgrep_types import OPERATORS_WITH_CHILDREN
 from semgrep.semgrep_types import pattern_name_for_operator
-from semgrep.semgrep_types import pattern_names_for_operator
 from semgrep.semgrep_types import PatternId
 from semgrep.semgrep_types import Range
 from semgrep.semgrep_types import TAINT_MODE
 from semgrep.util import flatten
+from semgrep.verbose_logging import getLogger
+
+logger = getLogger(__name__)
+
+DebugRanges = Union[Set[Range], Dict[str, Set[Range]]]
+DebugRangesConverted = Union[List[Range], Dict[str, List[Range]]]
+
+
+def stabilize_evaluation_ordering(
+    iterable: Iterable, key: Optional[Callable] = None
+) -> Iterable:
+    # Set reverse=True so we find the "nearest" pattern match or range, looking
+    # backwards. That is, if we have nested functions, classes, or other code blocks,
+    # we will produce the innermost block as the finding context
+    return sorted(iterable, key=key, reverse=True)
+
+
+def convert_ranges(ranges: DebugRanges) -> DebugRangesConverted:
+    # Make ranges JSON serializable and sort for performing comparisons
+    return (
+        sorted(list(ranges))
+        if isinstance(ranges, set)
+        else {k: sorted(list(v)) for k, v in ranges.items()}
+    )
+
+
+@attr.s(auto_attribs=True, frozen=True)
+class DebuggingStep:
+    filter: str
+    pattern_id: Optional[str]
+    ranges: DebugRangesConverted = attr.ib(converter=convert_ranges)
+    metavar_ranges: Dict[str, List[PatternMatch]]
+
+
+def add_debugging_info(
+    expression: BooleanRuleExpression,
+    output_ranges: Set[Range],
+    pattern_ids_to_pattern_matches: Dict[PatternId, List[PatternMatch]],
+    steps_for_debugging: List[DebuggingStep],
+) -> None:
+
+    metavars_for_patterns: Dict[str, List[PatternMatch]] = defaultdict(list)
+    if expression.pattern_id is None:
+        metavars_for_patterns = {}
+    else:
+        for pattern in pattern_ids_to_pattern_matches.get(expression.pattern_id, []):
+            for metavar, metavar_values in pattern.metavariables.items():
+                metavars_for_patterns[metavar].append(metavar_values)
+
+    logger.debug(f"after filter '{expression.operator}': {output_ranges}")
+
+    steps_for_debugging.append(
+        DebuggingStep(
+            pattern_name_for_operator(expression.operator),
+            expression.pattern_id,
+            output_ranges,
+            metavars_for_patterns,
+        )
+    )
+
+
+def compare_propagated_metavariable(
+    _range: Range,
+    pattern_match: PatternMatch,
+    metavariable: str,
+) -> bool:
+
+    return (
+        metavariable in _range.propagated_metavariables
+        and metavariable in pattern_match.metavariable_uids
+        and _range.propagated_metavariables[metavariable]
+        == pattern_match.metavariable_uids[metavariable]
+    )
 
 
 def get_re_range_matches(
@@ -40,17 +116,25 @@ def get_re_range_matches(
 
     result: Set[Range] = set()
     for _range in ranges:
-        if metavariable not in _range.vars:
+        if (
+            metavariable not in _range.metavariables
+            and metavariable not in _range.propagated_metavariables
+        ):
             logger.debug(f"metavariable '{metavariable}' missing in range '{_range}'")
             continue
 
         any_matching_ranges = any(
             pm.range == _range
-            and metavariable in pm.metavars
+            and metavariable in pm.metavariables
             and re.match(regex, pm.get_metavariable_value(metavariable))
             for pm in pattern_matches
         )
-        if any_matching_ranges:
+        any_propagated_ranges = any(
+            re.match(regex, pm.get_metavariable_value(metavariable))
+            for pm in pattern_matches
+            if compare_propagated_metavariable(_range, pm, metavariable)
+        )
+        if any_matching_ranges or any_propagated_ranges:
             result.add(_range)
 
     return result
@@ -96,13 +180,16 @@ def get_comparison_range_matches(
 
     result: Set[Range] = set()
     for _range in ranges:
-        if metavariable not in _range.vars:
+        if (
+            metavariable not in _range.metavariables
+            and metavariable not in _range.propagated_metavariables
+        ):
             logger.debug(f"metavariable '{metavariable}' missing in range '{_range}'")
             continue
 
         any_matching_ranges = any(
             pm.range == _range
-            and metavariable in pm.metavars
+            and metavariable in pm.metavariables
             and compare_range_match(
                 metavariable,
                 comparison,
@@ -112,197 +199,40 @@ def get_comparison_range_matches(
             )
             for pm in pattern_matches
         )
-        if any_matching_ranges:
+        any_propagated_ranges = any(
+            compare_range_match(
+                metavariable,
+                comparison,
+                strip,
+                base,
+                pm.get_metavariable_value(metavariable),
+            )
+            for pm in pattern_matches
+            if compare_propagated_metavariable(_range, pm, metavariable)
+        )
+        if any_matching_ranges or any_propagated_ranges:
             result.add(_range)
 
     return result
 
 
-def add_debugging_info(
-    expression: BooleanRuleExpression,
-    output_ranges: Set[Range],
-    metavars_for_patterns: Dict[str, List[Any]],
-    steps_for_debugging: List[Dict[str, Any]],
-) -> None:
-    logger.debug(f"after filter `{expression.operator}`: {output_ranges}")
-    steps_for_debugging.append(
-        {
-            "filter": pattern_name_for_operator(expression.operator),
-            "pattern_id": expression.pattern_id,
-            "ranges": list(output_ranges),
-            "metavar_ranges": metavars_for_patterns,
-        }
-    )
-
-
-def get_metavar_debugging_info(
-    expression: BooleanRuleExpression,
-    pattern_ids_to_pattern_matches: Dict[PatternId, List[PatternMatch]],
-) -> Dict[str, List[Any]]:
-    # get all metavariable information into steps_for_debugging
-    if expression.pattern_id is not None:
-        metavar_list_for_patterns = [
-            pattern.metavars
-            for pattern in pattern_ids_to_pattern_matches.get(expression.pattern_id, [])
-        ]
-    else:
-        return {}
-
-    # flatten list to be based on metavariable name.
-    metavars_for_patterns: Dict[str, List[PatternMatch]] = defaultdict()
-    for entry in metavar_list_for_patterns:
-        if not bool(
-            entry
-        ):  # check if dictionary is empty. Don't call .items on it if it is empty.
-            continue
-
-        for key, val in entry.items():
-            if key in metavars_for_patterns.keys():
-                metavars_for_patterns[key].append(val)
-            else:
-                metavars_for_patterns[key] = [val]
-    return metavars_for_patterns
-
-
-def _evaluate_single_expression(
-    expression: BooleanRuleExpression,
-    pattern_ids_to_pattern_matches: Dict[PatternId, List[PatternMatch]],
-    ranges_left: Set[Range],
-    steps_for_debugging: List[Dict[str, Any]],
-    flags: Optional[Dict[str, Any]] = None,
-) -> Set[Range]:
-
-    assert expression.pattern_id, f"<internal error: expected pattern id: {expression}>"
-    results_for_pattern = [
-        x.range for x in pattern_ids_to_pattern_matches.get(expression.pattern_id, [])
-    ]
-    output_ranges: Set[Range] = set()
-    metavars_for_patterns = get_metavar_debugging_info(
-        expression, pattern_ids_to_pattern_matches
-    )
-
-    if expression.operator == OPERATORS.AND:
-        add_debugging_info(
-            expression, output_ranges, metavars_for_patterns, steps_for_debugging
-        )
-        # remove all ranges that don't equal the ranges for this pattern
-        return ranges_left.intersection(results_for_pattern)
-    elif expression.operator == OPERATORS.AND_NOT:
-        # remove all ranges that DO equal the ranges for this pattern
-        # difference_update = Remove all elements of another set from this set.
-        output_ranges = ranges_left.difference(results_for_pattern)
-        add_debugging_info(
-            expression, output_ranges, metavars_for_patterns, steps_for_debugging
-        )
-        return output_ranges
-    elif expression.operator == OPERATORS.AND_INSIDE:
-        # remove all ranges (not enclosed by) or (not equal to) the inside ranges
-        for arange in ranges_left:
-            for keep_inside_this_range in results_for_pattern:
-                is_enclosed = keep_inside_this_range.is_enclosing_or_eq(arange)
-                # print(
-                #    f'candidate range is {arange}, needs to be `{operator}` {keep_inside_this_range}; keep?: {keep}')
-                if is_enclosed:
-                    output_ranges.add(arange)
-                    break  # found a match, no need to keep going
-
-        add_debugging_info(
-            expression, output_ranges, metavars_for_patterns, steps_for_debugging
-        )
-        return output_ranges
-    elif expression.operator == OPERATORS.AND_NOT_INSIDE:
-        # remove all ranges enclosed by or equal to
-        output_ranges = ranges_left.copy()
-        for arange in ranges_left:
-            for keep_inside_this_range in results_for_pattern:
-                if keep_inside_this_range.is_enclosing_or_eq(arange):
-                    output_ranges.remove(arange)
-                    break
-        add_debugging_info(
-            expression, output_ranges, metavars_for_patterns, steps_for_debugging
-        )
-        return output_ranges
-    elif expression.operator == OPERATORS.WHERE_PYTHON:
-        if not flags or not flags[RCE_RULE_FLAG]:
-            raise SemgrepError(
-                f"at least one rule needs to execute arbitrary code; this is dangerous! if you want to continue, enable the flag: {RCE_RULE_FLAG}",
-                code=NEED_ARBITRARY_CODE_EXEC_EXIT_CODE,
-            )
-        if not isinstance(expression.operand, str):
-            raise SemgrepError("pattern-where-python must have a string value")
-
-        # Look through every range that hasn't been filtered yet
-        for pattern_match in list(flatten(pattern_ids_to_pattern_matches.values())):
-            # Only need to check where-python clause if the range hasn't already been filtered
-
-            if pattern_match.range in ranges_left:
-                logger.debug(
-                    f"WHERE is {expression.operand}, metavars: {pattern_match.metavars}"
-                )
-                if _where_python_statement_matches(
-                    expression.operand, pattern_match.metavars
-                ):
-                    output_ranges.add(pattern_match.range)
-        add_debugging_info(
-            expression, output_ranges, metavars_for_patterns, steps_for_debugging
-        )
-        return output_ranges
-    elif expression.operator == OPERATORS.REGEX:
-        # remove all ranges that don't equal the ranges for this pattern
-        output_ranges = ranges_left.intersection(results_for_pattern)
-        add_debugging_info(
-            expression, output_ranges, metavars_for_patterns, steps_for_debugging
-        )
-        return output_ranges
-    elif expression.operator == OPERATORS.METAVARIABLE_REGEX:
-        operand = cast(Dict[str, Any], expression.operand)
-        output_ranges = get_re_range_matches(
-            operand["metavariable"],
-            operand["regex"],
-            ranges_left,
-            list(flatten(pattern_ids_to_pattern_matches.values())),
-        )
-        add_debugging_info(
-            expression, output_ranges, metavars_for_patterns, steps_for_debugging
-        )
-        return output_ranges
-    elif expression.operator == OPERATORS.METAVARIABLE_COMPARISON:
-        operand = cast(Dict[str, Any], expression.operand)
-        output_ranges = get_comparison_range_matches(
-            operand["metavariable"],
-            operand["comparison"],
-            operand.get("strip"),
-            operand.get("base"),
-            ranges_left,
-            list(flatten(pattern_ids_to_pattern_matches.values())),
-        )
-        add_debugging_info(
-            expression, output_ranges, metavars_for_patterns, steps_for_debugging
-        )
-        return output_ranges
-    else:
-        raise UnknownOperatorError(f"unknown operator {expression.operator}")
-
-
-def _where_python_statement_matches(
-    where_expression: str, metavars: Dict[str, Any]
-) -> bool:
-    # TODO: filter out obvious dangerous things here
+def compare_where_python(where_expression: str, pattern_match: PatternMatch) -> bool:
     result = False
+    return_var = "semgrep_pattern_return"
+    lines = where_expression.strip().split("\n")
+    to_eval = "\n".join(lines[:-1] + [f"{return_var} = {lines[-1]}"])
 
-    local_vars = {k: v["abstract_content"] for k, v in metavars.items()}
-    RETURN_VAR = "semgrep_pattern_return"
+    local_vars = {
+        metavar: pattern_match.get_metavariable_value(metavar)
+        for metavar in pattern_match.metavariables
+    }
+    scope = {"vars": local_vars}
+
     try:
-        cleaned_where_expression = where_expression.strip()
-        lines = cleaned_where_expression.split("\n")
-        new_last_line = f"{RETURN_VAR} = {lines[-1]}"
-        lines[-1] = new_last_line
-        to_eval = "\n".join(lines)
-        scope = {"vars": local_vars}
         # fmt: off
         exec(to_eval, scope)  # nosem: contrib.dlint.dlint-equivalent.insecure-exec-use, python.lang.security.audit.exec-detected.exec-detected
         # fmt: on
-        result = scope[RETURN_VAR]  # type: ignore
+        result = scope[return_var]  # type: ignore
     except KeyError as ex:
         logger.error(
             f"could not find metavariable {ex} while evaluating where-python expression '{where_expression}', consider case where metavariable is missing"
@@ -319,64 +249,190 @@ def _where_python_statement_matches(
     return result
 
 
-def group_by_pattern_id(
-    pattern_matches: List[PatternMatch],
-) -> Dict[PatternId, List[PatternMatch]]:
-    by_id: Dict[PatternId, List[PatternMatch]] = {}
-    for pattern_match in pattern_matches:
-        by_id.setdefault(pattern_match.id, []).append(pattern_match)
-    return by_id
+def get_where_python_range_matches(
+    where_expression: str, ranges: Set[Range], pattern_matches: List[PatternMatch]
+) -> Set[Range]:
+
+    return {
+        pm.range
+        for pm in pattern_matches
+        if pm.range in ranges and compare_where_python(where_expression, pm)
+    }
 
 
-def safe_relative_to(a: Path, b: Path) -> Path:
-    try:
-        return a.relative_to(b)
-    except ValueError:
-        # paths had no common prefix; not possible to relativize
-        return a
+def filter_ranges_with_propagation(
+    ranges_left: Set[Range],
+    ranges_for_pattern: Set[Range],
+    predicate: Callable[[Range, Range], bool],
+    metavariable_propagation: bool,
+) -> Set[Range]:
+
+    stabilized_ranges_left = stabilize_evaluation_ordering(ranges_left)
+    stabilized_ranges_for_pattern = stabilize_evaluation_ordering(ranges_for_pattern)
+    result: Set[Range] = set()
+    for _range in stabilized_ranges_left:
+        matched = False
+        for pattern_range in stabilized_ranges_for_pattern:
+            if predicate(pattern_range, _range):
+                if metavariable_propagation:
+                    # We need a deepcopy here because Python sets are passed by reference,
+                    # and the call to update() will affect ranges referenced in other
+                    # recursive calls to _evaluate_expression
+                    new_range = copy.deepcopy(_range)
+                    new_range.propagated_metavariables.update(
+                        pattern_range.metavariables
+                    )
+                else:
+                    new_range = _range
+                matched = True
+        if matched:
+            result.add(new_range)
+    return result
 
 
-def evaluate(
-    rule: Rule, pattern_matches: List[PatternMatch], allow_exec: bool
-) -> Tuple[List[RuleMatch], List[Dict[str, Any]]]:
-    """
-    Takes a Rule and list of pattern matches from a single file and
-    handles the boolean expression evaluation of the Rule's patterns
-    Returns a list of RuleMatches.
-    """
-    output = []
-    pattern_ids_to_pattern_matches = group_by_pattern_id(pattern_matches)
-    steps_for_debugging = [
-        {
-            "filter": "initial",
-            "pattern_id": None,
-            "ranges": {
-                k: list(set(vv.range for vv in v))
-                for k, v in pattern_ids_to_pattern_matches.items()
-            },
+def _evaluate_single_expression(
+    expression: BooleanRuleExpression,
+    pattern_ids_to_pattern_matches: Dict[PatternId, List[PatternMatch]],
+    ranges_left: Set[Range],
+    allow_exec: bool,
+    metavariable_propagation: bool,
+) -> Set[Range]:
+
+    if not expression.pattern_id:
+        raise SemgrepError(f"expected expression '{expression}' to have pattern_id")
+
+    ranges_for_pattern = {
+        x.range for x in pattern_ids_to_pattern_matches.get(expression.pattern_id, [])
+    }
+
+    if expression.operator == OPERATORS.AND:
+        # remove all ranges that don't equal the ranges for this pattern
+        output_ranges = filter_ranges_with_propagation(
+            ranges_left,
+            ranges_for_pattern,
+            predicate=lambda r1, r2: r1 == r2,
+            metavariable_propagation=metavariable_propagation,
+        )
+    elif expression.operator == OPERATORS.AND_NOT:
+        # remove all ranges that DO equal the ranges for this pattern
+        output_ranges = ranges_left.difference(ranges_for_pattern)
+    elif expression.operator == OPERATORS.AND_INSIDE:
+        # remove all ranges (not enclosed by) or (not equal to) the inside ranges
+        output_ranges = filter_ranges_with_propagation(
+            ranges_left,
+            ranges_for_pattern,
+            predicate=lambda r1, r2: r1.is_enclosing_or_eq(r2),
+            metavariable_propagation=metavariable_propagation,
+        )
+    elif expression.operator == OPERATORS.AND_NOT_INSIDE:
+        # remove all ranges enclosed by or equal to
+        output_ranges = {
+            _range
+            for _range in ranges_left
+            if not any(
+                pattern_range.is_enclosing_or_eq(_range)
+                for pattern_range in ranges_for_pattern
+            )
         }
-    ]
-    logger.debug(str(pattern_ids_to_pattern_matches))
-    if rule.mode == TAINT_MODE:
+    elif expression.operator == OPERATORS.REGEX:
+        # remove all ranges that don't equal the ranges for this pattern
+        output_ranges = ranges_left.intersection(ranges_for_pattern)
+    elif expression.operator == OPERATORS.NOT_REGEX:
+        # remove the result if pattern-not-regex is within another pattern
+        output_ranges = {
+            _range
+            for _range in ranges_left
+            if not any(
+                _range.is_range_enclosing_or_eq(pattern_range)
+                or pattern_range.is_range_enclosing_or_eq(_range)
+                for pattern_range in ranges_for_pattern
+            )
+        }
+    elif expression.operator == OPERATORS.WHERE_PYTHON:
+        if not allow_exec:
+            raise SemgrepError(
+                f"at least one rule needs to execute arbitrary code; this is dangerous! if you want to continue, enable the flag: {RCE_RULE_FLAG}",
+                code=NEED_ARBITRARY_CODE_EXEC_EXIT_CODE,
+            )
+        if not isinstance(expression.operand, str):
+            raise SemgrepError(
+                f"expected operator '{expression.operator}' to have string value guaranteed by schema"
+            )
+        output_ranges = get_where_python_range_matches(
+            expression.operand,
+            ranges_left,
+            list(flatten(pattern_ids_to_pattern_matches.values())),
+        )
+
+    elif expression.operator == OPERATORS.METAVARIABLE_REGEX:
+        if not isinstance(expression.operand, YamlMap):
+            raise SemgrepError(
+                f"expected operator '{expression.operator}' to have mapping value guaranteed by schema"
+            )
+        output_ranges = get_re_range_matches(
+            expression.operand["metavariable"].value,
+            expression.operand["regex"].value,
+            ranges_left,
+            list(flatten(pattern_ids_to_pattern_matches.values())),
+        )
+    elif expression.operator == OPERATORS.METAVARIABLE_COMPARISON:
+        if not isinstance(expression.operand, YamlMap):
+            raise SemgrepError(
+                f"expected operator '{expression.operator}' to have mapping value guaranteed by schema"
+            )
+        strip = expression.operand.get("strip")
+        base = expression.operand.get("base")
+        output_ranges = get_comparison_range_matches(
+            expression.operand["metavariable"].value,
+            expression.operand["comparison"].value,
+            strip.value if strip is not None else None,
+            base.value if base is not None else None,
+            ranges_left,
+            list(flatten(pattern_ids_to_pattern_matches.values())),
+        )
+    else:
+        raise UnknownOperatorError(f"unknown operator {expression.operator}")
+
+    return output_ranges
+
+
+def create_output(
+    rule: Rule,
+    pattern_matches: List[PatternMatch],
+    valid_ranges_to_output: Optional[Set[Range]] = None,
+) -> List[RuleMatch]:
+    output = []
+
+    if valid_ranges_to_output is None:
         valid_ranges_to_output = {
             pattern_match.range for pattern_match in pattern_matches
         }
-    else:
-        valid_ranges_to_output = evaluate_expression(
-            rule.expression,
-            pattern_ids_to_pattern_matches,
-            flags={RCE_RULE_FLAG: allow_exec},
-            steps_for_debugging=steps_for_debugging,
-        )
 
-        # only output matches which are inside these offsets!
-        logger.debug(f"compiled result {valid_ranges_to_output}")
-        logger.debug("-" * 80)
+    propagated_metavariable_lookup = {
+        _range: {
+            metavariable: pm.get_metavariable_value(metavariable)
+            for pm in pattern_matches
+            for metavariable in _range.propagated_metavariables
+            if compare_propagated_metavariable(_range, pm, metavariable)
+        }
+        for _range in valid_ranges_to_output
+    }
 
     for pattern_match in pattern_matches:
         if pattern_match.range in valid_ranges_to_output:
-            message = interpolate_message_metavariables(rule, pattern_match)
-            fix = interpolate_fix_metavariables(rule, pattern_match)
+            propagated_metavariables = propagated_metavariable_lookup[
+                pattern_match.range
+            ]
+            message = interpolate_string_with_metavariables(
+                rule.message, pattern_match, propagated_metavariables
+            )
+            fix = (
+                interpolate_string_with_metavariables(
+                    rule.fix, pattern_match, propagated_metavariables
+                )
+                if rule.fix
+                else None
+            )
             rule_match = RuleMatch.from_pattern_match(
                 rule.id,
                 pattern_match,
@@ -388,46 +444,82 @@ def evaluate(
             )
             output.append(rule_match)
 
-    return output, steps_for_debugging
+    return sorted(output, key=lambda rule_match: rule_match._pattern_match.range.start)
 
 
-def interpolate_message_metavariables(rule: Rule, pattern_match: PatternMatch) -> str:
-    msg_text = rule.message
-    for metavar in pattern_match.metavars:
-        msg_text = msg_text.replace(
-            metavar, pattern_match.get_metavariable_value(metavar)
+def evaluate(
+    rule: Rule, pattern_matches: List[PatternMatch], allow_exec: bool
+) -> Tuple[List[RuleMatch], List[Dict[str, Any]]]:
+    """
+    Takes a Rule and list of pattern matches from a single file and
+    handles the boolean expression evaluation of the Rule's patterns
+    Returns a list of RuleMatches.
+    """
+    output = []
+
+    pattern_ids_to_pattern_matches: Dict[PatternId, List[PatternMatch]] = OrderedDict()
+    for pm in stabilize_evaluation_ordering(pattern_matches, key=lambda pm: pm.id):
+        pattern_ids_to_pattern_matches.setdefault(pm.id, []).append(pm)
+
+    initial_ranges: DebugRanges = {
+        pattern_id: set(pm.range for pm in pattern_matches)
+        for pattern_id, pattern_matches in pattern_ids_to_pattern_matches.items()
+    }
+    steps_for_debugging = [DebuggingStep("initial", None, initial_ranges, {})]
+
+    if rule.mode == TAINT_MODE:
+        valid_ranges_to_output = {
+            pattern_match.range for pattern_match in pattern_matches
+        }
+    else:
+        valid_ranges_to_output = evaluate_expression(
+            rule.expression,
+            pattern_ids_to_pattern_matches,
+            allow_exec=allow_exec,
+            steps_for_debugging=steps_for_debugging,
         )
-    return msg_text
+
+        # only output matches which are inside these offsets!
+        logger.debug(f"compiled result {valid_ranges_to_output}")
+        logger.debug(BREAK_LINE)
+
+    output = create_output(rule, pattern_matches, valid_ranges_to_output)
+
+    return output, [attr.asdict(step) for step in steps_for_debugging]
 
 
-def interpolate_fix_metavariables(
-    rule: Rule, pattern_match: PatternMatch
-) -> Optional[str]:
-    fix_str = rule.fix
-    if fix_str is None:
-        return None
-    for metavar in pattern_match.metavars:
-        fix_str = fix_str.replace(
-            metavar, pattern_match.get_metavariable_value(metavar)
+def interpolate_string_with_metavariables(
+    text: str, pattern_match: PatternMatch, propagated_metavariables: Dict[str, str]
+) -> str:
+    """Interpolates a string with the metavariables contained in it, returning a new string"""
+
+    # Sort by metavariable length to avoid name collisions (eg. $X2 must be handled before $X)
+    for metavariable in sorted(pattern_match.metavariables, key=len, reverse=True):
+        text = text.replace(
+            metavariable, pattern_match.get_metavariable_value(metavariable)
         )
-    return fix_str
+
+    # Sort by metavariable length to avoid name collisions (eg. $X2 must be handled before $X)
+    for metavariable in sorted(propagated_metavariables.keys(), key=len, reverse=True):
+        text = text.replace(metavariable, propagated_metavariables[metavariable])
+
+    return text
 
 
 def evaluate_expression(
     expression: BooleanRuleExpression,
     pattern_ids_to_pattern_matches: Dict[PatternId, List[PatternMatch]],
-    steps_for_debugging: List[Dict[str, Any]],
-    flags: Optional[Dict[str, Any]] = None,
+    steps_for_debugging: List[DebuggingStep],
+    allow_exec: bool,
 ) -> Set[Range]:
-    ranges_left = set(
-        [x.range for x in flatten(pattern_ids_to_pattern_matches.values())]
-    )
+    ranges_left = {x.range for x in flatten(pattern_ids_to_pattern_matches.values())}
     return _evaluate_expression(
         expression,
         pattern_ids_to_pattern_matches,
         ranges_left,
         steps_for_debugging,
-        flags=flags,
+        allow_exec=allow_exec,
+        metavariable_propagation=False,
     )
 
 
@@ -435,16 +527,15 @@ def _evaluate_expression(
     expression: BooleanRuleExpression,
     pattern_ids_to_pattern_matches: Dict[PatternId, List[PatternMatch]],
     ranges_left: Set[Range],
-    steps_for_debugging: List[Dict[str, Any]],
-    flags: Optional[Dict[str, Any]] = None,
+    steps_for_debugging: List[DebuggingStep],
+    allow_exec: bool,
+    metavariable_propagation: bool,
 ) -> Set[Range]:
-    if (
-        expression.operator == OPERATORS.AND_EITHER
-        or expression.operator == OPERATORS.AND_ALL
-    ):
-        assert (
-            expression.children is not None
-        ), f"{pattern_names_for_operator(OPERATORS.AND_EITHER)} or {pattern_names_for_operator(OPERATORS.AND_ALL)} must have a list of subpatterns"
+    if expression.operator in OPERATORS_WITH_CHILDREN:
+        if expression.children is None:
+            raise SemgrepError(
+                f"operator '{expression.operator}' must have child operators"
+            )
 
         # recurse on the nested expressions
         if expression.operator == OPERATORS.AND_EITHER:
@@ -455,12 +546,13 @@ def _evaluate_expression(
                     pattern_ids_to_pattern_matches,
                     ranges_left.copy(),
                     steps_for_debugging,
-                    flags=flags,
+                    allow_exec=allow_exec,
+                    metavariable_propagation=False,
                 )
                 for expr in expression.children
             ]
             ranges_left.intersection_update(flatten(evaluated_ranges))
-        else:
+        elif expression.operator == OPERATORS.AND_ALL:
             # chain intersection eagerly; intersect for every AND'ed child
             for expr in expression.children:
                 remainining_ranges = _evaluate_expression(
@@ -468,29 +560,32 @@ def _evaluate_expression(
                     pattern_ids_to_pattern_matches,
                     ranges_left.copy(),
                     steps_for_debugging,
-                    flags=flags,
+                    allow_exec=allow_exec,
+                    metavariable_propagation=True,
                 )
                 ranges_left.intersection_update(remainining_ranges)
-
-        logger.debug(f"after filter `{expression.operator}`: {ranges_left}")
-        steps_for_debugging.append(
-            {
-                "filter": f"{pattern_name_for_operator(expression.operator)}",
-                "pattern_id": None,
-                "ranges": list(ranges_left),
-            }
-        )
+        else:
+            raise UnknownOperatorError(f"unknown operator {expression.operator}")
     else:
-        assert (
-            expression.children is None
-        ), f"only `{pattern_names_for_operator(OPERATORS.AND_EITHER)}` or `{pattern_names_for_operator(OPERATORS.AND_ALL)}` expressions can have multiple subpatterns"
+        if expression.children is not None:
+            raise SemgrepError(
+                f"operator '{expression.operator}' must not have child operators"
+            )
+
         ranges_left = _evaluate_single_expression(
             expression,
             pattern_ids_to_pattern_matches,
             ranges_left,
-            steps_for_debugging,
-            flags=flags,
+            allow_exec=allow_exec,
+            metavariable_propagation=metavariable_propagation,
         )
+
+    add_debugging_info(
+        expression,
+        ranges_left,
+        pattern_ids_to_pattern_matches,
+        steps_for_debugging,
+    )
     return ranges_left
 
 

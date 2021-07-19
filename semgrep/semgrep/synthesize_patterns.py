@@ -3,8 +3,8 @@ from typing import List
 
 import semgrep.config_resolver
 from semgrep.constants import PLEASE_FILE_ISSUE_TEXT
-from semgrep.constants import SEMGREP_PATH
 from semgrep.error import SemgrepError
+from semgrep.util import SEMGREP_PATH
 from semgrep.util import sub_check_output
 
 
@@ -26,4 +26,4 @@ def synthesize_patterns(
         raise SemgrepError(
             f"error invoking semgrep with:\n\t{' '.join(cmd)}\n\t{ex}\n{PLEASE_FILE_ISSUE_TEXT}"
         )
-    print(output.decode())
+    print(output.decode(errors="replace"))

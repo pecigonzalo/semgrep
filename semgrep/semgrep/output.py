@@ -1,248 +1,120 @@
 import contextlib
-import json
-import logging
+import pathlib
 import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
-from typing import cast
 from typing import Dict
 from typing import FrozenSet
 from typing import Generator
 from typing import IO
-from typing import Iterator
 from typing import List
 from typing import NamedTuple
 from typing import Optional
 from typing import Set
+from typing import Type
 
 import colorama
-from junit_xml import TestSuite
 
-from semgrep import __VERSION__
 from semgrep import config_resolver
-from semgrep.constants import BREAK_LINE_CHAR
-from semgrep.constants import BREAK_LINE_WIDTH
-from semgrep.constants import MAX_LINES_FLAG_NAME
 from semgrep.constants import OutputFormat
 from semgrep.error import FINDINGS_EXIT_CODE
 from semgrep.error import Level
 from semgrep.error import MatchTimeoutError
 from semgrep.error import SemgrepError
+from semgrep.formatter.base import BaseFormatter
+from semgrep.formatter.emacs import EmacsFormatter
+from semgrep.formatter.json import JsonFormatter
+from semgrep.formatter.junit_xml import JunitXmlFormatter
+from semgrep.formatter.sarif import SarifFormatter
+from semgrep.formatter.text import TextFormatter
+from semgrep.formatter.vim import VimFormatter
 from semgrep.profile_manager import ProfileManager
+from semgrep.profiling import ProfilingData
 from semgrep.rule import Rule
 from semgrep.rule_match import RuleMatch
 from semgrep.stats import make_loc_stats
 from semgrep.stats import make_target_stats
 from semgrep.util import is_url
 from semgrep.util import with_color
+from semgrep.verbose_logging import getLogger
 
-logger = logging.getLogger(__name__)
-
-
-def color_line(
-    line: str,
-    line_number: int,
-    start_line: int,
-    start_col: int,
-    end_line: int,
-    end_col: int,
-) -> str:
-    start_color = 0 if line_number > start_line else start_col
-    # column offset
-    start_color = max(start_color - 1, 0)
-    end_color = end_col if line_number >= end_line else len(line) + 1 + 1
-    end_color = max(end_color - 1, 0)
-    line = (
-        line[:start_color]
-        + colorama.Style.BRIGHT
-        + line[start_color : end_color + 1]  # want the color to include the end_col
-        + colorama.Style.RESET_ALL
-        + line[end_color + 1 :]
-    )
-    return line
+logger = getLogger(__name__)
 
 
-def finding_to_line(
-    rule_match: RuleMatch,
-    color_output: bool,
-    per_finding_max_lines_limit: Optional[int],
-    show_separator: bool,
-) -> Iterator[str]:
-    path = rule_match.path
-    start_line = rule_match.start.get("line")
-    end_line = rule_match.end.get("line")
-    start_col = rule_match.start.get("col")
-    end_col = rule_match.end.get("col")
-    trimmed = 0
-    if path:
-        lines = rule_match.extra.get("fixed_lines") or rule_match.lines
-        if per_finding_max_lines_limit:
-            trimmed = len(lines) - per_finding_max_lines_limit
-            lines = lines[:per_finding_max_lines_limit]
-
-        for i, line in enumerate(lines):
-            line = line.rstrip()
-            line_number = ""
-            if start_line:
-                if color_output:
-                    line = color_line(
-                        line, start_line + i, start_line, start_col, end_line, end_col  # type: ignore
-                    )
-                    line_number = f"{colorama.Fore.GREEN}{start_line + i}{colorama.Style.RESET_ALL}"
-                else:
-                    line_number = f"{start_line + i}"
-
-            yield f"{line_number}:{line}" if line_number else f"{line}"
-        trimmed_str = (
-            f" [hid {trimmed} additional lines, adjust with {MAX_LINES_FLAG_NAME}] "
-        )
-        if per_finding_max_lines_limit != 1:
-            if trimmed > 0:
-                yield trimmed_str.center(BREAK_LINE_WIDTH, BREAK_LINE_CHAR)
-            elif show_separator:
-                yield BREAK_LINE_CHAR * BREAK_LINE_WIDTH
+def get_path_str(target: Path) -> str:
+    path_str = ""
+    try:
+        path_str = str(target.relative_to(pathlib.Path().absolute()))
+    except ValueError:
+        path_str = str(target)
+    return path_str
 
 
-def build_normal_output(
-    rule_matches: List[RuleMatch],
-    color_output: bool,
-    per_finding_max_lines_limit: Optional[int],
-) -> Iterator[str]:
-    RESET_COLOR = colorama.Style.RESET_ALL if color_output else ""
-    GREEN_COLOR = colorama.Fore.GREEN if color_output else ""
-    YELLOW_COLOR = colorama.Fore.YELLOW if color_output else ""
-    RED_COLOR = colorama.Fore.RED if color_output else ""
-    BLUE_COLOR = colorama.Fore.BLUE if color_output else ""
+def _build_time_target_json(
+    rules: List[Rule],
+    target: Path,
+    num_bytes: int,
+    profiling_data: ProfilingData,
+) -> Dict[str, Any]:
+    target_json: Dict[str, Any] = {}
+    path_str = get_path_str(target)
 
-    last_file = None
-    last_message = None
-    sorted_rule_matches = sorted(rule_matches, key=lambda r: (r.path, r.id))
-    for rule_index, rule_match in enumerate(sorted_rule_matches):
+    target_json["path"] = path_str
+    target_json["num_bytes"] = num_bytes
+    timings = [profiling_data.get_run_times(rule, target) for rule in rules]
+    target_json["parse_times"] = [timing.parse_time for timing in timings]
+    target_json["match_times"] = [timing.match_time for timing in timings]
+    target_json["run_times"] = [timing.run_time for timing in timings]
 
-        current_file = rule_match.path
-        check_id = rule_match.id
-        message = rule_match.message
-        severity = rule_match.severity.lower()
-        fix = rule_match.fix
-        if last_file is None or last_file != current_file:
-            if last_file is not None:
-                yield ""
-            yield f"{GREEN_COLOR}{current_file}{RESET_COLOR}"
-            last_message = None
-        # don't display the rule line if the check is empty
-        if (
-            check_id
-            and check_id != "-"
-            and (last_message is None or last_message != message)
-        ):
-            severity_prepend = ""
-            if severity:
-                if severity == "error":
-                    severity_prepend = f"{RED_COLOR}severity:{severity} "
-                elif severity == "warning":
-                    severity_prepend = f"{YELLOW_COLOR}severity:{severity} "
-                else:
-                    severity_prepend = f"severity:{severity} "
-            yield f"{severity_prepend}{YELLOW_COLOR}rule:{check_id}: {message}{RESET_COLOR}"
-
-        last_file = current_file
-        last_message = message
-        next_rule_match = (
-            sorted_rule_matches[rule_index + 1]
-            if rule_index != len(sorted_rule_matches) - 1
-            else None
-        )
-        is_same_file = (
-            next_rule_match.path == rule_match.path if next_rule_match else False
-        )
-        yield from finding_to_line(
-            rule_match,
-            color_output,
-            per_finding_max_lines_limit,
-            is_same_file,
-        )
-
-        if fix:
-            yield f"{BLUE_COLOR}autofix:{RESET_COLOR} {fix}"
-        elif rule_match.fix_regex:
-            fix_regex = rule_match.fix_regex
-            yield f"{BLUE_COLOR}autofix:{RESET_COLOR} s/{fix_regex.get('regex')}/{fix_regex.get('replacement')}/{fix_regex.get('count', 'g')}"
+    return target_json
 
 
-def build_output_json(
-    rule_matches: List[RuleMatch],
-    semgrep_structured_errors: List[SemgrepError],
-    all_targets: Set[Path],
-    show_json_stats: bool,
-    profiler: Optional[ProfileManager] = None,
-    debug_steps_by_rule: Optional[Dict[Rule, List[Dict[str, Any]]]] = None,
-) -> str:
-    output_json: Dict[str, Any] = {}
-    output_json["results"] = [rm.to_json() for rm in rule_matches]
-    if debug_steps_by_rule:
-        output_json["debug"] = [
-            {r.id: steps for r, steps in debug_steps_by_rule.items()}
-        ]
-    output_json["errors"] = [e.to_dict() for e in semgrep_structured_errors]
-    if show_json_stats:
-        output_json["stats"] = {
-            "targets": make_target_stats(all_targets),
-            "loc": make_loc_stats(all_targets),
-            "profiler": profiler.dump_stats() if profiler else None,
-        }
-    return json.dumps(output_json)
+def _build_time_json(
+    rules: List[Rule],
+    targets: Set[Path],
+    profiling_data: ProfilingData,  # (rule, target) -> times
+    profiler: Optional[ProfileManager],
+) -> Dict[str, Any]:
+    """Convert match times to a json-ready format.
 
-
-def build_junit_xml_output(
-    rule_matches: List[RuleMatch], rules: FrozenSet[Rule]
-) -> str:
+    Match times are obtained for each pair (rule, target) by running
+    semgrep-core. They exclude parsing time. One of the applications is
+    to estimate the performance of a rule, assuming the cost of parsing
+    the target file will become negligible once we run many rules on the
+    same AST.
     """
-    Format matches in JUnit XML format.
-    """
-    test_cases = [match.to_junit_xml() for match in rule_matches]
-    ts = TestSuite("semgrep results", test_cases)
-    return cast(str, TestSuite.to_xml_string([ts]))
+    time_info: Dict[str, Any] = {}
+    # this list of all rules names is given here so they don't have to be
+    # repeated for each target in the 'targets' field, saving space.
+    time_info["rules"] = [{"id": rule.id} for rule in rules]
+    time_info["rule_parse_info"] = [
+        profiling_data.get_rule_parse_time(rule) for rule in rules
+    ]
+    time_info["total_time"] = profiler.calls["total_time"][0] if profiler else -1.0
+    target_bytes = [Path(str(target)).resolve().stat().st_size for target in targets]
+    time_info["targets"] = [
+        _build_time_target_json(rules, target, num_bytes, profiling_data)
+        for target, num_bytes in zip(targets, target_bytes)
+    ]
+    time_info["total_bytes"] = sum(n for n in target_bytes)
+    return time_info
 
 
-def _sarif_tool_info() -> Dict[str, Any]:
-    return {"name": "semgrep", "semanticVersion": __VERSION__}
-
-
-def build_sarif_output(rule_matches: List[RuleMatch], rules: FrozenSet[Rule]) -> str:
-    """
-    Format matches in SARIF v2.1.0 formatted JSON.
-
-    - written based on https://help.github.com/en/github/finding-security-vulnerabilities-and-errors-in-your-code/about-sarif-support-for-code-scanning
-    - which links to this schema https://github.com/oasis-tcs/sarif-spec/blob/master/Schemata/sarif-schema-2.1.0.json
-    - full spec is at https://docs.oasis-open.org/sarif/sarif/v2.1.0/cs01/sarif-v2.1.0-cs01.html
-    """
-    output_dict = {
-        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
-        "version": "2.1.0",
-        "runs": [
-            {
-                "tool": {
-                    "driver": {
-                        **_sarif_tool_info(),
-                        "rules": [rule.to_sarif() for rule in rules],
-                    }
-                },
-                "results": [match.to_sarif() for match in rule_matches],
-            }
-        ],
-    }
-    return json.dumps(output_dict)
-
-
+# WARNING: this class is unofficially part of our external API. It can be passed
+# as an argument to our official API: 'semgrep_main.invoke_semgrep'. Try to minimize
+# changes to this API, and make them backwards compatible, if possible.
 class OutputSettings(NamedTuple):
     output_format: OutputFormat
-    output_destination: Optional[str]
-    error_on_findings: bool
-    verbose_errors: bool
-    strict: bool
-    output_per_finding_max_lines_limit: Optional[int]
-    json_stats: bool
+    output_destination: Optional[str] = None
+    output_per_finding_max_lines_limit: Optional[int] = None
+    output_per_line_max_chars_limit: Optional[int] = None
+    error_on_findings: bool = False
+    verbose_errors: bool = False  # to do: rename to just 'verbose'
+    strict: bool = False
+    debug: bool = False
+    json_stats: bool = False
+    output_time: bool = False
     timeout_threshold: int = 0
 
 
@@ -293,6 +165,10 @@ class OutputHandler:
         self.semgrep_structured_errors: List[SemgrepError] = []
         self.error_set: Set[SemgrepError] = set()
         self.has_output = False
+        self.filtered_rules: List[Rule] = []
+        self.profiling_data: ProfilingData = (
+            ProfilingData()
+        )  # (rule, target) -> duration
 
         self.final_error: Optional[Exception] = None
 
@@ -352,6 +228,8 @@ class OutputHandler:
         stats_line: str,
         all_targets: Set[Path],
         profiler: ProfileManager,
+        filtered_rules: List[Rule],
+        profiling_data: ProfilingData,  # (rule, target) -> duration
     ) -> None:
         self.has_output = True
         self.rules = self.rules.union(rule_matches_by_rule.keys())
@@ -360,11 +238,12 @@ class OutputHandler:
             for matches_of_one_rule in rule_matches_by_rule.values()
             for match in matches_of_one_rule
         ]
-
         self.profiler = profiler
         self.all_targets = all_targets
         self.stats_line = stats_line
         self.debug_steps_by_rule.update(debug_steps_by_rule)
+        self.filtered_rules = filtered_rules
+        self.profiling_data = profiling_data
 
     def handle_unhandled_exception(self, ex: Exception) -> None:
         """
@@ -380,7 +259,7 @@ class OutputHandler:
         if ex is None:
             return
         if isinstance(ex, SemgrepError):
-            if ex.level == Level.ERROR:  # nosem: r2c.registry.latest useless-if-body
+            if ex.level == Level.ERROR:
                 raise ex
             else:
                 if self.settings.strict:
@@ -402,9 +281,15 @@ class OutputHandler:
             output = self.build_output(
                 self.settings.output_destination is None and self.stdout.isatty(),
                 self.settings.output_per_finding_max_lines_limit,
+                self.settings.output_per_line_max_chars_limit,
             )
             if output:
-                print(output, file=self.stdout)
+                try:
+                    print(output, file=self.stdout)
+                except UnicodeEncodeError as ex:
+                    raise Exception(
+                        "Received output encoding error, please set PYTHONIOENCODING=utf-8"
+                    ) from ex
             if self.stats_line:
                 logger.info(self.stats_line)
 
@@ -450,40 +335,57 @@ class OutputHandler:
         logger.info(f"posting to {output_url}...")
         try:
             r = requests.post(output_url, data=output, timeout=10)
-            logger.debug(f"posted to {output_url} and got status_code:{r.status_code}")
+            logger.verbose(
+                f"posted to {output_url} and got status_code:{r.status_code}"
+            )
         except requests.exceptions.Timeout:
             raise SemgrepError(f"posting output to {output_url} timed out")
 
     def build_output(
-        self, color_output: bool, per_finding_max_lines_limit: Optional[int]
+        self,
+        color_output: bool,
+        per_finding_max_lines_limit: Optional[int],
+        per_line_max_chars_limit: Optional[int],
     ) -> str:
         output_format = self.settings.output_format
-        debug_steps = None
-        if output_format == OutputFormat.JSON_DEBUG:
-            debug_steps = self.debug_steps_by_rule
-        if output_format.is_json():
-            return build_output_json(
-                self.rule_matches,
-                self.semgrep_structured_errors,
+
+        extra: Dict[str, Any] = {}
+        if self.settings.debug:
+            extra["debug"] = [
+                {rule.id: steps for rule, steps in self.debug_steps_by_rule.items()}
+            ]
+        if self.settings.json_stats:
+            extra["stats"] = {
+                "targets": make_target_stats(self.all_targets),
+                "loc": make_loc_stats(self.all_targets),
+                "profiler": self.profiler.dump_stats() if self.profiler else None,
+            }
+        if self.settings.output_time:
+            extra["time"] = _build_time_json(
+                self.filtered_rules,
                 self.all_targets,
-                self.settings.json_stats,
+                self.profiling_data,
                 self.profiler,
-                debug_steps,
             )
-        elif output_format == OutputFormat.JUNIT_XML:
-            return build_junit_xml_output(self.rule_matches, self.rules)
-        elif output_format == OutputFormat.SARIF:
-            return build_sarif_output(self.rule_matches, self.rules)
-        elif output_format == OutputFormat.TEXT:
-            return "\n".join(
-                list(
-                    build_normal_output(
-                        self.rule_matches, color_output, per_finding_max_lines_limit
-                    )
-                )
-            )
-        else:
-            # https://github.com/python/mypy/issues/6366
-            raise RuntimeError(
-                f"Unhandled output format: {type(output_format).__name__}"
-            )
+        if output_format == OutputFormat.TEXT:
+            extra["color_output"] = color_output
+            extra["per_finding_max_lines_limit"] = per_finding_max_lines_limit
+            extra["per_line_max_chars_limit"] = per_line_max_chars_limit
+
+        formatters: Dict[OutputFormat, Type[BaseFormatter]] = {
+            OutputFormat.EMACS: EmacsFormatter,
+            OutputFormat.JSON: JsonFormatter,
+            OutputFormat.JUNIT_XML: JunitXmlFormatter,
+            OutputFormat.SARIF: SarifFormatter,
+            OutputFormat.TEXT: TextFormatter,
+            OutputFormat.VIM: VimFormatter,
+        }
+        formatter_type = formatters.get(output_format)
+
+        if formatter_type is None:
+            raise RuntimeError(f"Invalid output format: {output_format}")
+
+        formatter = formatter_type(
+            self.rules, self.rule_matches, self.semgrep_structured_errors, extra
+        )
+        return formatter.output()

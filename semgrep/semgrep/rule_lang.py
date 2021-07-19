@@ -12,13 +12,15 @@ from typing import KeysView
 from typing import List
 from typing import NewType
 from typing import Optional
+from typing import Set
+from typing import Tuple
 from typing import TypeVar
 from typing import Union
 
 import attr
 import jsonschema.exceptions
-import ruamel.yaml
 from jsonschema.validators import Draft7Validator
+from ruamel.yaml import MappingNode
 from ruamel.yaml import Node
 from ruamel.yaml import RoundTripConstructor
 from ruamel.yaml import YAML
@@ -40,9 +42,10 @@ class RuleSchema:
         Not thread safe.
         """
         if not cls._schema:
+            yaml = YAML()
             schema_path = Path(__file__).parent / "rule_schema.yaml"
             with schema_path.open() as fd:
-                cls._schema = ruamel.yaml.safe_load(fd)
+                cls._schema = yaml.load(fd)
         return cls._schema
 
 
@@ -317,12 +320,6 @@ class YamlMap:
         return self._internal.keys()
 
 
-def parse_yaml(contents: str) -> Dict[str, Any]:
-    # this uses the `RoundTripConstructor` which inherits from `SafeConstructor`
-    yaml = YAML(typ="rt")
-    return yaml.load(StringIO(contents))  # type: ignore
-
-
 def parse_yaml_preserve_spans(contents: str, filename: Optional[str]) -> YamlTree:
     """
     parse yaml into a YamlTree object. The resulting spans are tracked in SourceTracker
@@ -337,6 +334,32 @@ def parse_yaml_preserve_spans(contents: str, filename: Optional[str]) -> YamlTre
     class SpanPreservingRuamelConstructor(RoundTripConstructor):
         def construct_object(self, node: Node, deep: bool = False) -> YamlTree:
             r = super().construct_object(node, deep)
+
+            # Check for duplicate mapping keys.
+            # This -should- be caught and raised by ruamel.yaml.
+            # However, resetting the constructor below, where the line
+            # reads yaml.Constructor = SpanPreservingRuamelConstructor,
+            # causes ruamel's DuplicateKeyError not to be raised.
+            # This is a quick implementation that will check MappingNodes
+            #
+            if isinstance(node, MappingNode):
+                from semgrep.error import InvalidRuleSchemaError
+
+                kv_pairs: List[Tuple[Node, Node]] = [t for t in node.value]
+                uniq_key_names: Set[str] = set(t[0].value for t in kv_pairs)
+                # If the number of unique key names is less than the number
+                # of key-value nodes, then there's a duplicate key
+                if len(uniq_key_names) < len(kv_pairs):
+                    raise InvalidRuleSchemaError(
+                        short_msg="Detected duplicate key",
+                        long_msg=f"Detected duplicate key name, one of {list(sorted(uniq_key_names))}.",
+                        spans=[
+                            Span.from_node(
+                                node, source_hash=source_hash, filename=filename
+                            ).with_context(before=1, after=1)
+                        ],
+                    )
+
             if r is None:
                 from semgrep.error import InvalidRuleSchemaError
 
@@ -379,6 +402,7 @@ class RuleValidation:
         "patterns",
         "pattern-sinks",
         "pattern-sources",
+        "join",
     }
     INVALID_SENTINEL = " is not allowed for "
     BAD_TYPE_SENTINEL = "is not of type"
@@ -397,24 +421,24 @@ def _validation_error_message(error: jsonschema.exceptions.ValidationError) -> s
     any_of_invalid_keys = set()
     required = set()
     banned = set()
-    for m in (c.message for c in contexts):
-        if RuleValidation.BAD_TYPE_SENTINEL in m:
-            bad_type.add(m)
-        if RuleValidation.INVALID_SENTINEL in m:
-            ix = m.find(RuleValidation.INVALID_SENTINEL)
+    for context in contexts:
+        if RuleValidation.BAD_TYPE_SENTINEL in context.message:
+            bad_type.add(context.message)
+        if RuleValidation.INVALID_SENTINEL in context.message:
             try:
-                preamble = ruamel.yaml.safe_load(m[:ix]).get("anyOf")
-                postscript = ruamel.yaml.safe_load(
-                    m[ix + len(RuleValidation.INVALID_SENTINEL) :]
-                )
-                for r in (p.get("required", [None])[0] for p in preamble):
-                    if r and r in postscript.keys():
+                required_keys = [
+                    k["required"][0]
+                    for k in context.validator_value.get("anyOf", [])
+                    if "required" in k and k["required"]
+                ]
+                for r in required_keys:
+                    if r and r in context.instance.keys():
                         any_of_invalid_keys.add(r)
-            except (json.JSONDecodeError, AttributeError) as ex:
-                invalid_keys.add(m)
-        if m.startswith(RuleValidation.BANNED_SENTINEL):
-            banned.add(m)
-        require_matches = RuleValidation.REQUIRE_REGEX.match(m)
+            except (json.JSONDecodeError, AttributeError):
+                invalid_keys.add(context.message)
+        if context.message.startswith(RuleValidation.BANNED_SENTINEL):
+            banned.add(context.message)
+        require_matches = RuleValidation.REQUIRE_REGEX.match(context.message)
         if require_matches:
             required.add(require_matches[1])
 

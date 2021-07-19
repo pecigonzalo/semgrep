@@ -11,25 +11,27 @@
         "is_ignored": false,
         "lines": "console.log(x == x)",
         "message": "Detected a useless comparison operation `x == x` or `x != x`. This\noperation is always true.\nIf testing for floating point NaN, use `math.isnan`, or\n`cmath.isnan` if the number is complex.\n",
-        "metadata": {},
+        "metadata": {
+          "category": "correctness",
+          "license": "Commons Clause License Condition v1.0[LGPL-2.1-only]",
+          "source": "https://semgrep.dev/r/javascript.lang.correctness.useless-eqeq.eqeq-is-bad"
+        },
         "metavars": {
           "$X": {
             "abstract_content": "x",
             "end": {
               "col": 14,
               "line": 3,
-              "offset": 25
+              "offset": 62
             },
             "start": {
               "col": 13,
               "line": 3,
-              "offset": 24
+              "offset": 61
             },
             "unique_id": {
-              "kind": "Global",
               "sid": 1,
-              "type": "id",
-              "value": "x"
+              "type": "id"
             }
           }
         },
@@ -50,8 +52,12 @@
       "extra": {
         "is_ignored": false,
         "lines": "    return a + b == a + b",
-        "message": "This is always True: `a + b == a + b` or `a + b != a + b`. If testing for floating point NaN, use `math.isnan(a + b)`,\nor `cmath.isnan(a + b)` if the number is complex.\n",
-        "metadata": {},
+        "message": "This expression is always True: `a + b == a + b` or `a + b != a + b`. If testing for floating point NaN, use `math.isnan(a + b)`, or `cmath.isnan(a + b)` if the number is complex.",
+        "metadata": {
+          "category": "correctness",
+          "license": "Commons Clause License Condition v1.0[LGPL-2.1-only]",
+          "source": "https://semgrep.dev/r/python.lang.correctness.useless-eqeq.useless-eqeq"
+        },
         "metavars": {
           "$X": {
             "abstract_content": "a+b",

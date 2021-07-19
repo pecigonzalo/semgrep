@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import logging
 import multiprocessing
 import os
 
@@ -8,22 +7,28 @@ import semgrep.config_resolver
 import semgrep.semgrep_main
 import semgrep.test
 from semgrep import __VERSION__
+from semgrep.bytesize import parse_size
 from semgrep.constants import DEFAULT_CONFIG_FILE
+from semgrep.constants import DEFAULT_MAX_CHARS_PER_LINE
 from semgrep.constants import DEFAULT_MAX_LINES_PER_FINDING
+from semgrep.constants import DEFAULT_MAX_TARGET_SIZE
 from semgrep.constants import DEFAULT_TIMEOUT
+from semgrep.constants import MAX_CHARS_FLAG_NAME
 from semgrep.constants import MAX_LINES_FLAG_NAME
 from semgrep.constants import OutputFormat
 from semgrep.constants import RCE_RULE_FLAG
 from semgrep.constants import SEMGREP_URL
 from semgrep.dump_ast import dump_parsed_ast
 from semgrep.error import SemgrepError
+from semgrep.metric_manager import metric_manager
 from semgrep.output import managed_output
 from semgrep.output import OutputSettings
 from semgrep.synthesize_patterns import synthesize_patterns
 from semgrep.target_manager import optional_stdin_target
+from semgrep.verbose_logging import getLogger
 from semgrep.version import is_running_latest
 
-logger = logging.getLogger(__name__)
+logger = getLogger(__name__)
 try:
     CPU_COUNT = multiprocessing.cpu_count()
 except NotImplementedError:
@@ -51,14 +56,8 @@ def cli() -> None:
     config = parser.add_argument_group("config")
     config_ex = config.add_mutually_exclusive_group()
     config_ex.add_argument(
-        "-g",
-        "--generate-config",
-        action="store_true",
-        help=f"Generate starter configuration file, {DEFAULT_CONFIG_FILE}",
-    )
-
-    config_ex.add_argument(
-        "-f",
+        "-f",  # for backwards compatibility
+        "-c",
         "--config",
         action="append",
         default=[],
@@ -68,11 +67,19 @@ def cli() -> None:
             "name. See https://semgrep.dev/docs/writing-rules/rule-syntax for information on configuration file format."
         ),
     )
-
     config_ex.add_argument(
         "-e",
         "--pattern",
         help="Code search pattern. See https://semgrep.dev/docs/writing-rules/pattern-syntax for information on pattern features.",
+    )
+    config.add_argument(
+        "-g",
+        "--generate-config",
+        action="store",
+        nargs="?",
+        const=DEFAULT_CONFIG_FILE,
+        type=argparse.FileType("x"),
+        help=f"Generate starter configuration file. Defaults to {DEFAULT_CONFIG_FILE}.",
     )
     config.add_argument(
         "-l",
@@ -90,7 +97,13 @@ def cli() -> None:
     config.add_argument(
         "--strict",
         action="store_true",
-        help="Only invoke semgrep if configuration files(s) are valid.",
+        help="Return a nonzero exit code when WARN level errors are encountered. Fails early if invalid configuration files are present.",
+    )
+    config.add_argument(
+        "--optimizations",
+        nargs="?",
+        default="all",
+        help="Turn on/off optimizations. Default = 'all'. Use 'none' to turn all optimizations off.",
     )
 
     parser.add_argument(
@@ -180,6 +193,18 @@ def cli() -> None:
     )
 
     config.add_argument(
+        "--max-target-bytes",
+        type=parse_size,
+        default=DEFAULT_MAX_TARGET_SIZE,
+        help=(
+            "Maximum size for a file to be scanned by semgrep, e.g '1.5MB'. "
+            "Any input program larger than this will be ignored. "
+            "A zero or negative value disables this filter. "
+            f"Defaults to {DEFAULT_MAX_TARGET_SIZE} bytes."
+        ),
+    )
+
+    config.add_argument(
         "--timeout-threshold",
         type=int,
         default=0,
@@ -200,16 +225,6 @@ def cli() -> None:
 
     # output options
     output = parser.add_argument_group("output")
-
-    output.add_argument(
-        "-q",
-        "--quiet",
-        action="store_true",
-        help=(
-            "Do not print any logging messages to stderr. Finding output will still be sent to stdout. Exit code "
-            "provides success status."
-        ),
-    )
 
     output.add_argument(
         "--no-rewrite-rule-ids",
@@ -233,28 +248,28 @@ def cli() -> None:
         "--json", action="store_true", help="Output results in JSON format."
     )
     output.add_argument(
-        "--save-test-output-tar",
+        "--time",
         action="store_true",
         help=(
-            "Store json output as a tarball that will be uploaded as a Github artifact."
+            "Include a timing summary with the results"
+            "If output format is json, provides times for each pair (rule, target)."
         ),
-    )
-    output.add_argument(
-        "--json-stats",
-        action="store_true",
-        help=argparse.SUPPRESS,  # this flag is experimental and users should not yet rely on the output being stable
-        # help="Include statistical information about performance in JSON output (experimental).",
-    )
-    output.add_argument(
-        "--debugging-json",
-        action="store_true",
-        help="Output JSON with extra debugging information (experimental).",
     )
     output.add_argument(
         "--junit-xml", action="store_true", help="Output results in JUnit XML format."
     )
     output.add_argument(
         "--sarif", action="store_true", help="Output results in SARIF format."
+    )
+    output.add_argument(
+        "--emacs",
+        action="store_true",
+        help="Output results in Emacs single-line format.",
+    )
+    output.add_argument(
+        "--vim",
+        action="store_true",
+        help="Output results in vim single-line format.",
     )
     output.add_argument("--test", action="store_true", help="Run test suite.")
     parser.add_argument(
@@ -270,7 +285,6 @@ def cli() -> None:
             "(can use --json)."
         ),
     )
-    output.add_argument("--synthesize-patterns", help=argparse.SUPPRESS)
     output.add_argument(
         "--error",
         action="store_true",
@@ -304,7 +318,6 @@ def cli() -> None:
             "containing a 'nosem' comment at the end."
         ),
     )
-
     output.add_argument(
         MAX_LINES_FLAG_NAME,
         type=int,
@@ -314,10 +327,23 @@ def cli() -> None:
         ),
     )
 
-    # logging options
-    logging_ = parser.add_argument_group("logging")
+    output.add_argument(
+        MAX_CHARS_FLAG_NAME,
+        type=int,
+        default=DEFAULT_MAX_CHARS_PER_LINE,
+        help=("Maximum number of characters to show per line."),
+    )
 
-    logging_.add_argument(
+    # verbosity options
+    verbosity_group = parser.add_argument_group("verbosity")
+    verbosity_ex = verbosity_group.add_mutually_exclusive_group()
+    verbosity_ex.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help=("Only output findings"),
+    )
+    verbosity_ex.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -325,15 +351,29 @@ def cli() -> None:
             "Show more details about what rules are running, which files failed to parse, etc."
         ),
     )
-
-    output.add_argument(
+    verbosity_ex.add_argument(
         "--debug",
         action="store_true",
-        help="Set the logging level to DEBUG",
+        help="Output debugging information",
     )
 
     parser.add_argument(
         "--version", action="store_true", help="Show the version and exit."
+    )
+
+    metric_group = parser.add_argument_group("config")
+    metric_ex = metric_group.add_mutually_exclusive_group()
+    metric_ex.add_argument(
+        "--enable-metrics",
+        action="store_true",
+        help="Opt-in to metrics. Defaults to what SEMGREP_SEND_METRICS envvar is set to",
+        default=os.environ.get("SEMGREP_SEND_METRICS"),
+    )
+    metric_ex.add_argument(
+        "--disable-metrics",
+        action="store_false",
+        help="Opt-out of metrics.",
+        dest="enable_metrics",
     )
 
     parser.add_argument(
@@ -347,11 +387,49 @@ def cli() -> None:
         help="Disable checking for latest version.",
     )
 
+    # These flags are deprecated or experimental - users should not
+    # rely on their existence, or their output being stable
+    output.add_argument(
+        "--json-stats",
+        action="store_true",
+        help=argparse.SUPPRESS,
+        # help="Include statistical information about performance in JSON output (experimental).",
+    )
+    output.add_argument(
+        "--json-time",
+        action="store_true",
+        help=argparse.SUPPRESS,
+        # help="Deprecated alias for --json + --time",
+    )
+    output.add_argument(
+        "--debugging-json",
+        action="store_true",
+        help=argparse.SUPPRESS,
+        # help="Deprecated alias for --json + --debug",
+    )
+    output.add_argument(
+        "--save-test-output-tar",
+        action="store_true",
+        help=argparse.SUPPRESS,
+        # help="Save --test output for use in semgrep-app registry",
+    )
+    output.add_argument(
+        "--synthesize-patterns",
+        help=argparse.SUPPRESS,
+        # help="Legacy pattern recommendation functionality for use in semgrep-app playground",
+    )
+
     ### Parse and validate
     args = parser.parse_args()
+
     if args.version:
         print(__VERSION__)
         return
+
+    if args.enable_metrics:
+        metric_manager.enable()
+    else:
+        metric_manager.disable()
 
     if args.pattern and not args.lang:
         parser.error("-e/--pattern and -l/--lang must both be specified")
@@ -359,8 +437,10 @@ def cli() -> None:
     if args.dump_ast and not args.lang:
         parser.error("--dump-ast and -l/--lang must both be specified")
 
+    output_time = args.time or args.json_time
+
     # set the flags
-    semgrep.util.set_flags(args.debug, args.quiet, args.force_color)
+    semgrep.util.set_flags(args.verbose, args.debug, args.quiet, args.force_color)
 
     # change cwd if using docker
     try:
@@ -370,24 +450,29 @@ def cli() -> None:
         raise e
 
     output_format = OutputFormat.TEXT
-    if args.json:
+    if args.json or args.json_time or args.debugging_json:
         output_format = OutputFormat.JSON
-    elif args.debugging_json:
-        output_format = OutputFormat.JSON_DEBUG
     elif args.junit_xml:
         output_format = OutputFormat.JUNIT_XML
     elif args.sarif:
         output_format = OutputFormat.SARIF
+    elif args.emacs:
+        output_format = OutputFormat.EMACS
+    elif args.vim:
+        output_format = OutputFormat.VIM
 
     output_settings = OutputSettings(
         output_format=output_format,
         output_destination=args.output,
         error_on_findings=args.error,
         strict=args.strict,
+        debug=args.debugging_json,
         verbose_errors=args.verbose,
         timeout_threshold=args.timeout_threshold,
         json_stats=args.json_stats,
+        output_time=output_time,
         output_per_finding_max_lines_limit=args.max_lines_per_finding,
+        output_per_line_max_chars_limit=args.max_chars_per_line,
     )
 
     if not args.disable_version_check:
@@ -412,7 +497,7 @@ def cli() -> None:
         elif args.synthesize_patterns:
             synthesize_patterns(args.lang, args.synthesize_patterns, target)
         elif args.validate:
-            configs, config_errors = semgrep.semgrep_main.get_config(
+            configs, config_errors = semgrep.config_resolver.get_config(
                 args.pattern, args.lang, args.config
             )
             valid_str = "invalid" if config_errors else "valid"
@@ -425,7 +510,9 @@ def cli() -> None:
                     output_handler.handle_semgrep_error(error)
                 raise SemgrepError("Please fix the above errors and try again.")
         elif args.generate_config:
-            semgrep.config_resolver.generate_config()
+            semgrep.config_resolver.generate_config(
+                args.generate_config, args.lang, args.pattern
+            )
         else:
             semgrep.semgrep_main.main(
                 output_handler=output_handler,
@@ -437,6 +524,7 @@ def cli() -> None:
                 jobs=args.jobs,
                 include=args.include,
                 exclude=args.exclude,
+                max_target_bytes=args.max_target_bytes,
                 strict=args.strict,
                 autofix=args.autofix,
                 dryrun=args.dryrun,
@@ -448,4 +536,5 @@ def cli() -> None:
                 timeout_threshold=args.timeout_threshold,
                 skip_unknown_extensions=args.skip_unknown_extensions,
                 severity=args.severity,
+                optimizations=args.optimizations,
             )

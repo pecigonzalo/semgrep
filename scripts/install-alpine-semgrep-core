@@ -32,29 +32,21 @@ if [[ "$(basename "$(pwd)")" != semgrep ]]; then
 fi
 
 echo "Install missing packages"
-sudo apk add --no-cache m4
+sudo apk add --no-cache m4 pcre-dev
 
 echo "Install submodules"
-git submodule update --init --recursive
+git submodule update --init --recursive --depth 1
 
-echo "Install ocaml-tree-sitter"
-./scripts/install-ocaml-tree-sitter
-
-echo "Install spacegrep"
-(
-  cd spacegrep
-  opam install --deps-only -y .
-  DUNE_PROFILE=static make
-  make install
-)
+echo "Install tree-sitter runtime and prepare ocaml-tree-sitter source"
+./scripts/install-tree-sitter-runtime
 
 echo "Install pfff dependencies"
 (
-  cd semgrep-core/pfff
+  cd semgrep-core/src/pfff
   opam install --deps-only -y .
 )
 
-echo "Install semgrep-core"
+echo "Install semgrep-core and spacegrep"
 (
   cd semgrep-core
   opam install --deps-only -y .
@@ -66,6 +58,6 @@ echo "Copy executables to artifacts archive"
 rm -rf ocaml-build-artifacts
 bin=ocaml-build-artifacts/bin
 mkdir -p "$bin"
-cp ./spacegrep/_build/install/default/bin/spacegrep "$bin"
+cp ./semgrep-core/_build/install/default/bin/spacegrep "$bin"
 cp ./semgrep-core/_build/install/default/bin/semgrep-core "$bin"
 tar czf ocaml-build-artifacts.tgz ocaml-build-artifacts

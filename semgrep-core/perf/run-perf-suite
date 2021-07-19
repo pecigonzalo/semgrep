@@ -6,7 +6,6 @@
 import argparse
 import os
 import subprocess
-import sys
 import time
 import urllib.request
 from typing import List
@@ -15,7 +14,7 @@ HOST = "https://dashboard.semgrep.dev"
 
 
 class Test:
-    def __init__(self, name: str, lang: str, target: str):
+    def __init__(self, name: str, lang: str, target: str, is_config: bool = False):
         # Test name. Pattern file name is NAME.sgrep.
         self.name = name
 
@@ -25,18 +24,49 @@ class Test:
         # Target file name
         self.target = target
 
+        # Whether the file is a config
+        self.is_config = is_config
+
 
 TESTS = [
     # Control. No other test can be faster than this one.
     Test("empty", "js", "empty.js"),
+    #
     # Match on a simple statement, no ellipsis. Serves as the baseline
     # for the other tests on the same file.
     Test("stmts-simple", "js", "l10000.js"),
+    # Single ellipsis without backreference: $A; ... foo($B);
+    Test("stmts-ellipsis-ab", "js", "l10000.js"),
     # Single ellipsis on statements, with backreference to statement
     # that matches in many places: $A; ... foo($A);
-    Test("stmts-ellipsis", "js", "l10000.js"),
-    # Double ellipsis on statements: $A; ... $B; ... foo($A);
-    Test("stmts-double-ellipsis", "js", "l1000.js"),
+    Test("stmts-ellipsis-aa", "js", "l10000.js"),
+    # Double ellipsis on statements without backref: $A; ... $B; ... foo($C);
+    Test("stmts-double-ellipsis-abc", "js", "l1000.js"),
+    # Double ellipsis on statements with backref: $A; ... $B; ... foo($B);
+    Test("stmts-double-ellipsis-abb", "js", "l1000.js"),
+    # Double ellipsis on statements with backref: $A; ... $A; ... foo($B);
+    Test("stmts-double-ellipsis-aab", "js", "l1000.js"),
+    # Double ellipsis on statements with backref: $A; ... $B; ... foo($A);
+    Test("stmts-double-ellipsis-aba", "js", "l1000.js"),
+    # Double ellipsis on statements with backrefs: $A; ... $A; ... foo($A);
+    Test("stmts-double-ellipsis-aaa", "js", "l1000.js"),
+    # Constness analysis of a large function
+    Test("constness", "csharp", "l5000.cs"),
+    #
+    # Real world examples (.sgrep or .yaml files when True last argument)
+    #
+    # Metavariable as a key in a class definition with ellipsis
+    Test("anyorder-metavar-key", "java", "l5000.java"),
+    # Two pattern-not-insides with ellipsis
+    Test("stmts-ellipsis-inside", "js", "l1000.js", True),
+    # Multiple pattern-nots with multiple pattern-eithrs
+    Test("metavariable-regexp-dict", "generic", "l5000.json", True),
+    Test("metavariable-regexp-dict2", "json", "l5000.json", True),
+    #
+    # TODO, not yet optimized
+    #
+    # Multiple pattern-nots with multiple pattern-eithrs
+    Test("range-stmts", "python", "l300.py", True),
 ]
 
 
@@ -46,23 +76,38 @@ class Result:
         self.duration = duration
 
 
-def run_tests(dirname: str, tests: List[Test]) -> List[Result]:
+def run_tests(
+    dirname: str, tests: List[Test], no_cache: bool, max_cache: bool
+) -> List[Result]:
     results = []
     for test in tests:
-        pattern_file = os.path.join(dirname, test.name + ".sgrep")
+        ext = ".sgrep"
+        flag = "-f"
+        if test.is_config:
+            ext = ".yaml"
+            flag = "-config"
+
+        pattern_file = os.path.join(dirname, test.name + ext)
         target_file = os.path.join(dirname, test.target)
+        target_file_gz = os.path.join(dirname, test.target + ".gz")
+
+        if os.path.isfile(target_file_gz):
+            subprocess.check_call(["gunzip", "-k", "-f", target_file_gz])
 
         t1 = time.time()
-        p = subprocess.run(
-            [
-                "semgrep-core",
-                "-lang",
-                test.lang,
-                "-f",
-                pattern_file,
-                target_file,
-            ]
-        )
+        args = [
+            "semgrep-core",
+            "-lang",
+            test.lang,
+            flag,
+            pattern_file,
+            target_file,
+        ]
+        if no_cache:
+            args.append("-no_opt_cache")
+        elif max_cache:
+            args.append("-opt_max_cache")
+        p = subprocess.run(args)  # nosem
         t2 = time.time()
 
         p.check_returncode()
@@ -91,6 +136,12 @@ def main() -> None:
         "--list", help="list available tests and exit", action="store_true"
     )
     parser.add_argument(
+        "--no-cache", help="disable caching during matching", action="store_true"
+    )
+    parser.add_argument(
+        "--max-cache", help="use most aggressive caching", action="store_true"
+    )
+    parser.add_argument(
         "--upload", help="upload results to semgrep dashboard", action="store_true"
     )
     args = parser.parse_args()
@@ -104,7 +155,7 @@ def main() -> None:
             tests = [test for test in TESTS if test.name == args.name]
         else:
             tests = TESTS
-        results = run_tests("input", tests)
+        results = run_tests("input", tests, args.no_cache, args.max_cache)
         if args.upload:
             upload_results(results)
 

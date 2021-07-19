@@ -1,12 +1,26 @@
 #
-# First, build a static 'semgrep-core' binary on Alpine because it comes set up
-# for it (requires using musl rather than glibc).
+# First, build a *static* 'semgrep-core' binary on Alpine because it comes set
+# up for it (requires using musl rather than glibc).
 #
-# Then 'semgrep-core' alone is copied to a container with that takes care
-# of the 'semgrep' wrapping.
+# Then 'semgrep-core' alone is copied to a container which takes care
+# of the 'semgrep-python' wrapping.
 #
 
-FROM returntocorp/ocaml:alpine-2020-10-28 as build-semgrep-core
+# The docker base image below in the FROM currently uses OCaml 4.12.0
+# See https://github.com/returntocorp/ocaml-layer/blob/master/configs/alpine.sh
+#
+# coupling: if you modify the OCaml version there, you probably also need
+# to modify:
+# - scripts/osx-release.sh
+# - doc/SEMGREP_CORE_CONTRIBUTING.md
+# - https://github.com/Homebrew/homebrew-core/blob/master/Formula/semgrep.rb
+# Note that many .github/workflows/ use returntocorp/ocaml:alpine, which should
+# be the latest, but may differ from this one.
+FROM returntocorp/ocaml:alpine-2021-07-15 as build-semgrep-core
+
+USER root
+# for ocaml-pcre now used in semgrep-core
+RUN apk add --no-cache pcre-dev
 
 USER user
 WORKDIR /home/user
@@ -14,7 +28,6 @@ WORKDIR /home/user
 COPY --chown=user .gitmodules /semgrep/.gitmodules
 COPY --chown=user .git/ /semgrep/.git/
 COPY --chown=user semgrep-core/ /semgrep/semgrep-core/
-COPY --chown=user spacegrep/ /semgrep/spacegrep/
 COPY --chown=user scripts /semgrep/scripts
 
 WORKDIR /semgrep
@@ -24,24 +37,22 @@ WORKDIR /semgrep
 RUN git clean -dfX
 RUN git submodule foreach --recursive git clean -dfX
 
-RUN git submodule update --init --recursive
+RUN git submodule update --init --recursive --depth 1
 
-RUN eval "$(opam env)" && ./scripts/install-ocaml-tree-sitter
-RUN eval "$(opam env)" && opam install --deps-only -y spacegrep/
-RUN eval "$(opam env)" && opam install --deps-only -y semgrep-core/pfff/
+RUN eval "$(opam env)" && ./scripts/install-tree-sitter-runtime
+RUN eval "$(opam env)" && opam install --deps-only -y semgrep-core/src/pfff/
 RUN eval "$(opam env)" && opam install --deps-only -y semgrep-core/
-RUN eval "$(opam env)" && DUNE_PROFILE=static make -C spacegrep/
 RUN eval "$(opam env)" && make -C semgrep-core/ all
 
 # Sanity checks
-RUN test -x ./spacegrep/_build/install/default/bin/spacegrep
+RUN test -x ./semgrep-core/_build/install/default/bin/spacegrep
 RUN ./semgrep-core/_build/install/default/bin/semgrep-core -version
 
 #
 # We change container, bringing only the 'semgrep-core' binary with us.
 #
 
-FROM python:3.7.7-alpine3.11
+FROM python:3.9.1-alpine3.13
 LABEL maintainer="support@r2c.dev"
 
 # ugly: circle CI requires valid git and ssh programs in the container
@@ -53,18 +64,21 @@ COPY --from=build-semgrep-core \
 RUN semgrep-core -version
 
 COPY --from=build-semgrep-core \
-     /semgrep/spacegrep/_build/install/default/bin/spacegrep \
+     /semgrep/semgrep-core/_build/install/default/bin/spacegrep \
      /usr/local/bin/spacegrep
 RUN ln -sf spacegrep /usr/local/bin/spacecat
 
 COPY semgrep /semgrep
-RUN HOMEBREW_SYSTEM='NOCORE' python -m pip install /semgrep
+RUN SEMGREP_SKIP_BIN=true python -m pip install /semgrep
 RUN semgrep --version
 
 RUN mkdir -p /src
 RUN chmod 777 /src
 RUN mkdir -p /tmp/.cache
 RUN chmod 777 /tmp/.cache
+
+# Let the user know how their container was built
+COPY dockerfiles/semgrep.Dockerfile /Dockerfile
 
 RUN adduser -D -u 1000 semgrep
 USER 1000

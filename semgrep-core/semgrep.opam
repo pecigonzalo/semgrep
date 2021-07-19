@@ -16,25 +16,33 @@ bug-reports: "https://github.com/returntocorp/semgrep/issues"
 
 # These are build dependencies.
 # Development-only dependencies are in 'dev/dev.opam'.
+# A big dependency is pfff, but it's now a submodule so it's not listed here
+#TODO: restore  "bisect_ppx" {>= "2.5.0"} once can use ppxlib 0.22.0
+
+# For semgrep CI to be fast, we try to pre-install these packages as part of
+# of the base docker image. When you add a new package or change a version
+# here, please also update the list of packages there:
 #
+#   https://github.com/returntocorp/ocaml-layer/blob/master/common-config.sh
+#
+# or ask Martin to do so.
+# You may also need to update the ocaml:alpine-xxx image used in ../Dockerfile.
 depends: [
   "dune" {>= "2.7.0" }
-  "bisect_ppx" {dev & >= "2.5.0"}
-  "easy_logging_yojson"
-  "ocamlgraph"
+  "bloomf"
+  "atdgen"
   "yojson"
   "yaml"
-  "menhir"
-  "grain_dypgen"
+  "ppx_deriving"
+  "ppx_hash"
   "uucp"
   "uutf"
   "re"
+  "pcre"
   "parmap"
-  "lsp" {= "1.1.0"}
+  "ppxlib" {= "0.20.0" }
+  "lsp" {= "1.3.0"}
+  "comby-kernel" {= "1.4.1"}
 ]
 
 build: [make]
-
-pin-depends: [
-  ["bisect_ppx.git" "git+https://github.com/aantron/bisect_ppx.git"]
-]

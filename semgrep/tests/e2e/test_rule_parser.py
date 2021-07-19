@@ -4,6 +4,7 @@ from subprocess import CalledProcessError
 import pytest
 
 from ..conftest import TESTS_PATH
+from semgrep.constants import OutputFormat
 
 syntax_dir = TESTS_PATH / "e2e" / "rules" / "syntax"
 syntax_passes = [f.with_suffix("").name for f in syntax_dir.glob("good*.yaml")]
@@ -27,6 +28,12 @@ def test_rule_parser__failure(run_semgrep_in_tmp, snapshot, filename):
     snapshot.assert_match(str(excinfo.value.returncode), "returncode.txt")
 
 
+def test_regex_with_bad_language(run_semgrep_in_tmp, snapshot):
+    with pytest.raises(CalledProcessError) as excinfo:
+        run_semgrep_in_tmp("rules/badlanguage.yaml")
+    assert excinfo.value.returncode != 0
+
+
 def test_rule_parser__empty(run_semgrep_in_tmp, snapshot):
     with pytest.raises(CalledProcessError) as excinfo:
         run_semgrep_in_tmp(f"rules/syntax/empty.yaml")
@@ -47,7 +54,7 @@ def test_rule_parser__failure__error_messages(run_semgrep_in_tmp, snapshot, file
         run_semgrep_in_tmp(
             f"rules/syntax/{filename}.yaml",
             options=["--force-color"],
-            output_format="normal",
+            output_format=OutputFormat.TEXT,
         )
 
     snapshot.assert_match(
@@ -71,6 +78,7 @@ def test_rule_parser_cli_pattern(run_semgrep_in_tmp, snapshot):
     # Check pretty print output
     with pytest.raises(CalledProcessError) as excinfo:
         run_semgrep_in_tmp(
-            options=["-e", "#include<asdf><<>>><$X>", "-l", "c"], output_format="normal"
+            options=["-e", "#include<asdf><<>>><$X>", "-l", "c"],
+            output_format=OutputFormat.TEXT,
         )
     snapshot.assert_match(excinfo.value.stderr, "error.txt")

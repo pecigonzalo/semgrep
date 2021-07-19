@@ -1,0 +1,25 @@
+{
+  "errors": [],
+  "results": [
+    {
+      "check_id": "rules.pattern-not-regex.pattern-not-regex-bug",
+      "end": {
+        "col": 4,
+        "line": 1
+      },
+      "extra": {
+        "is_ignored": false,
+        "lines": "Foo==1.1.1",
+        "message": "Found $TAG",
+        "metadata": {},
+        "metavars": {},
+        "severity": "ERROR"
+      },
+      "path": "targets/pattern-not-regex/issue2465.requirements.txt",
+      "start": {
+        "col": 1,
+        "line": 1
+      }
+    }
+  ]
+}

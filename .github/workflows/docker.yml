@@ -14,34 +14,53 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
-      - name: Build the Docker image
-        run: docker build -t semgrep-dev .
-      - name: Check the Docker image
-        run: ./scripts/validate-docker-build.sh semgrep-dev
-      - name: Push Develop Image if on develop branch
-        if: ${{ github.event_name == 'push'}}
-        uses: docker/build-push-action@v1
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-          repository: returntocorp/semgrep
-          tags: develop
-      - name: Push Commit Hash if PR
+
+      - name: Pull previous image for caching purposes
+        run: |
+          docker pull returntocorp/semgrep:develop || :
+
+      - name: Build semgrep image with default Dockerfile
+        run: docker build -t returntocorp/semgrep:develop .
+
+      - name: Check the semgrep Docker image
+        run: ./scripts/validate-docker-build.sh returntocorp/semgrep:develop
+
+      - name: Login to DockerHub
+        env:
+          DOCKERHUB_USER: ${{ secrets.DOCKER_USERNAME }}
+          DOCKERHUB_PASS: ${{ secrets.DOCKER_PASSWORD }}
+        run: ./.github/docker-login
+
+      - name: Push semgrep image if on develop branch
+        if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+        run: docker push returntocorp/semgrep:develop
+
+      - name: Push commit hash if PR
         # Don't run when PR is from a fork
         # For security, we do not autopush to docker when from PRs
         # said PRs do not have access to secrets so will fail anyway but
         # nicer to not have a "failing" CI job in the PR so don't even
         # try if we can detect is coming from a fork
-        if: ${{ github.event_name == 'pull_request' }} && ${{ github.event.pull_request.head.repo.full_name == github.repository }}
-        uses: docker/build-push-action@v1
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-          repository: returntocorp/semgrep
-          tags: ${{ github.event.pull_request.head.sha }}
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          tag=returntocorp/semgrep:${{ github.sha }}
+          docker build -t "$tag" .
+          docker push "$tag"
+
       - name: update dev.semgrep.dev
         run: curl --fail -X POST https://dev.semgrep.dev/api/admin/update-docker
       - name: update staging.semgrep.dev
         run: curl --fail -X POST https://staging.semgrep.dev/api/admin/update-docker
       - name: update semgrep.dev
         run: curl --fail -X POST https://semgrep.dev/api/admin/update-docker
+
+      # Extend the semgrep image, changing the entry point to bash and
+      # adding some utilities. This image is meant for internal uses
+      # such as benchmarks.
+      - name: Build and push semgrep-dev image if on develop branch
+        if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+        run: |
+          docker build \
+            -f dockerfiles/semgrep-dev.Dockerfile \
+            -t returntocorp/semgrep-dev:develop .
+          docker push returntocorp/semgrep-dev:develop
