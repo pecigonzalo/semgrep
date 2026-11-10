@@ -31,7 +31,14 @@ dummy:
 dummy-local:
 	./run-benchmarks --dummy --upload
 
+#TODO: we should not delete bench/dummy/!
 .PHONY: clean
 clean:
 	rm -rf bench/*/input
 	rm -rf bench/*/output
+
+.PHONY: regenerate-tests
+regenerate-tests:
+	./run-benchmarks --config configs/ci_small_repos.yaml --std-only --save-findings-to snapshots/ci_small_repos_baseline.json
+	jq . snapshots/ci_small_repos_baseline.json > snapshots/ci_small_repos_baseline.json.tmp
+	mv snapshots/ci_small_repos_baseline.json.tmp snapshots/ci_small_repos_baseline.json

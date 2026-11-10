@@ -1,8 +1,0 @@
-[31msemgrep error[39m: Invalid rule schema
-  --> rules/syntax/badpaths2.yaml:8
-[94m8 | [39m      filename: "*.py"
-[94m9 | [39m    message: "$X is being assigned to one or two"
-
-[31mAdditional properties are not allowed ('filename' was unexpected)[39m
-
-run with --strict and there were 1 errors loading configs

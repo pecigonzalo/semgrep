@@ -1,0 +1,23 @@
+(library
+ (public_name semgrep.engine.tests)
+ (name semgrep_engine_tests)
+ (wrapped false)
+ (libraries
+   base
+   collections
+   commons
+   yojson
+
+   semgrep.core
+   semgrep.il
+   semgrep.engine
+ )
+ (preprocess
+    (pps
+      ppx_profiling
+      ppx_deriving.show
+      ppx_deriving_yojson
+      commons.ppx
+    )
+ )
+)

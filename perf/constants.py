@@ -1,3 +1,15 @@
+#
+# Copyright (c) 2021-2024 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 from pathlib import Path
 
 DASHBOARD_URL = "https://dashboard.semgrep.dev"
@@ -9,7 +21,7 @@ LPS_ENDPOINT = "semgrep.perf.lps"
 STD = "std"
 
 SEMGREP_USER_AGENT = "Semgrep/0.0.0-benchmark"
-RULE_CONFIG_CACHE_DIR = Path("rules_cache")
+RULE_CONFIG_CACHE_DIR = Path("bench/rules_cache")
 PREP_FILE_TEMPLATE = """#! /bin/sh
 #
 # Fetch rules and targets prior for the "r2c" benchmark.

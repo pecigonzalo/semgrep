@@ -1,8 +1,0 @@
-rules:
-  - id: test-regex
-    patterns:
-      - pattern-regex: '<.*?>'
-      - pattern-not-regex: 'div'
-    message: "test regex message"
-    languages: [regex]
-    severity: ERROR

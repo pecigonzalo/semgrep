@@ -1,4 +1,0 @@
-[dev-packages]
-sh = "*"
-click = "*"
-requests = "*"

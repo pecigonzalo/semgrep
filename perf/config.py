@@ -1,4 +1,18 @@
+#
+# Copyright (c) 2021-2024 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 import logging
+import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -7,10 +21,12 @@ from typing import Optional
 from typing import Type
 from urllib.parse import urlparse
 
-import attr
-from constants import SEMGREP_URL
-from constants import SEMGREP_USER_AGENT
+import requests
+from attrs import define
+from attrs import field
 from ruamel.yaml import YAML
+
+from semgrep.state import get_state
 
 
 logger = logging.getLogger(__file__)
@@ -24,25 +40,21 @@ logger.addHandler(handler)
 yaml = YAML(typ="rt")
 
 
-@attr.s
-class Repository(object):
-    url: str = attr.ib(default="")
-    commit_hash: str = attr.ib(default="HEAD")
+@define
+class Repository:
+    url: str = field(default="")
+    commit_hash: str = field(default="HEAD")
 
 
-@attr.s
-class RuleConfig(object):
-    config_str: str = attr.ib(default="")
+@define
+class RuleConfig:
+    config_str: str = field(default="")
 
     def _fetch_rule_config_from_url(self, rule_config_url: str) -> Optional[str]:
-        import requests
-
         logger.info(f"Fetching config from '{rule_config_url}'")
         try:
             r = requests.get(
-                rule_config_url,
-                headers={"User-Agent": SEMGREP_USER_AGENT},
-                timeout=60,
+                rule_config_url, headers={"User-Agent": "perf.config"}, timeout=60
             )
             r.raise_for_status()
         except requests.Timeout:
@@ -69,6 +81,29 @@ class RuleConfig(object):
         logger.info(f"Rule config '{self.config_str}' has been written to '{path}'")
         path.write_text(text)
 
+    def _fetch_njsscan_rules(self, cache_path: Path) -> None:
+        logger.debug("Getting rules from the njsscan repo")
+
+        cur_dir = os.getcwd()
+        repo = "https://github.com/ajinabraham/njsscan.git"
+        commit_id = "edc1d0a8b38bfb5421e21665284f83de3dbe636e"
+        njs_tempdir = "njsscan-temp"
+        njs_subdir = f"{njs_tempdir}/njsscan/rules/semantic_grep"
+
+        # Clone njsscan and move relevant rules to njsscan, then remove rest of repo
+        os.mkdir(cache_path / njs_tempdir)
+        os.chdir(cache_path / njs_tempdir)
+        os.system("git init")
+        os.system(f"git remote add origin {repo}")
+        os.system(f"git fetch --depth 1 origin ${commit_id}")
+        os.system("git checkout FETCH_HEAD -b tmp")
+        os.chdir("..")
+        os.replace(njs_subdir, "njsscan")
+        shutil.rmtree(njs_tempdir)
+
+        logger.debug("Done getting rules from njsscan repo")
+        os.chdir(cur_dir)
+
     def is_path(self) -> bool:
         logger.debug(
             f"Checking if config string is a path. Resolved path is {Path(self.config_str).expanduser().resolve()}"
@@ -86,7 +121,15 @@ class RuleConfig(object):
         """
         return self.config_str.find("/") == 1
 
+    def is_njsscan(self) -> bool:
+        """
+        Special case: Return true if the str is njsscan
+        """
+        return self.config_str == "njsscan"
+
     def normalize_rule_config_name(self) -> str:
+        if self.is_njsscan():
+            return self.config_str
         return (self.config_str.replace("/", ".") + ".yaml").strip(".")
 
     def resolve_to_cache(self, cache_path: Path) -> None:
@@ -97,7 +140,14 @@ class RuleConfig(object):
         If the rule config string is a short config like 'p/r2c', download the rules and add that to the supplied cache path.
         Raises a ValueError if it cannot resolve the config string.
         """
-        if self.is_path():
+        if (
+            self.is_njsscan()
+        ):  # TODO make this flexible, don't rely on hardcoding njsscan
+            import os  # I don't know why this is necessary
+
+            os.mkdir(cache_path)
+            self._fetch_njsscan_rules(cache_path)
+        elif self.is_path():
             import os
             import shutil
 
@@ -123,29 +173,31 @@ class RuleConfig(object):
             consolidated_rules = self._fetch_rule_config_from_url(self.config_str)
             self._write(cache_path, consolidated_rules)
         elif self.is_short_config():
-            rule_config_url = f"{SEMGREP_URL}/{self.config_str}"
+            env = get_state().env
+            rule_config_url = f"{env.semgrep_url}/{self.config_str}"
             consolidated_rules = self._fetch_rule_config_from_url(rule_config_url)
             self._write(cache_path, consolidated_rules)
         else:
             raise ValueError(
                 f"Could not resolve location of the config string '{self.config_str}'. Try using a filesystem path or valid Semgrep config"
             )
+        return cache_path
 
 
-@attr.s
-class BenchmarkRunSetupData(object):
+@define
+class BenchmarkRunSetupData:
     """
     Stores data about an individual benchmark run
     """
 
-    run_name: str = attr.ib(default="benchmark_run")
-    rule_configs: List[RuleConfig] = attr.ib(default=["p/r2c"])
-    repositories: List[Repository] = attr.ib(factory=list)
-    semgrep_options: List[str] = attr.ib(factory=list)
+    run_name: str = field(default="benchmark_run")
+    rule_configs: List[RuleConfig] = field(default=["p/r2c"])
+    repositories: List[Repository] = field(factory=list)
+    semgrep_options: List[str] = field(default=[])
 
 
-@attr.s
-class SemgrepBenchmarkConfig(object):
+@define
+class SemgrepBenchmarkConfig:
     """
     Stores data needed to start a benchmarking run.
 
@@ -166,14 +218,14 @@ class SemgrepBenchmarkConfig(object):
     '''
     """
 
-    benchmark_setup_data: List[BenchmarkRunSetupData] = attr.ib(factory=list)
+    benchmark_setup_data: List[BenchmarkRunSetupData] = field(factory=list)
 
     @classmethod
     def parse_config(
         cls: Type["SemgrepBenchmarkConfig"], config_file: Path
     ) -> "SemgrepBenchmarkConfig":
         logger.debug(f"Using config at {config_file.absolute()}")
-        with open(config_file, "r") as fin:
+        with open(config_file) as fin:
             config = yaml.load(fin)
 
         return SemgrepBenchmarkConfig(

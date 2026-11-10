@@ -1,1 +1,0 @@
-{"errors": [{"code": 2, "level": "error", "message": "Invalid regexp in rule: '(abc': missing ) at position 4", "type": "SemgrepError"}], "results": []}

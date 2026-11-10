@@ -1,9 +1,0 @@
-[31msemgrep error[39m: Invalid rule schema
-  --> rules/syntax/badpaths1.yaml:8
-[94m8  | [39m      - "*.py"
-[94m9  | [39m      - "test/*"
-[94m10 | [39m    message: "$X is being assigned to one or two"
-
-[31m['*.py', 'test/*'] is not of type 'object'[39m
-
-run with --strict and there were 1 errors loading configs

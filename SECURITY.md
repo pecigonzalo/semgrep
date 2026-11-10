@@ -6,8 +6,8 @@ This project is under active development and we do our best to support the lates
 
 | Version | Supported          |
 | ------- | ------------------ |
-| latest   | :white_check_mark: |
+| latest  | :white_check_mark: |
 
 ## Reporting a Vulnerability
 
-Please email security@r2c.dev with any security issues in Semgrep. We take all reports seriously.
+Please email security@semgrep.com with any security issues in Semgrep. We take all reports seriously.
